@@ -155,6 +155,7 @@ UNICODE_FALLBACKS = {
     "calendar": "\U0001F4C5", "withdraw": "\U0001F4B8",
     "referral": "\U0001F91D", "default": "\U0001F4F1",
     "archive": "\U0001F4C2", "hourglass": "\u23F3",
+    "wallet": "\U0001F4B0", "minus": "\u2796",
 }
 
 def premium_icon(name):
@@ -248,8 +249,14 @@ def ibtn(text, callback_data=None, url=None, style=None, copy_text_str=None, ico
     # Fixed: Strip premium emoji HTML tags from button text (buttons don't support HTML)
     if isinstance(text, str):
         text = _BTN_STRIP_RE.sub(r'\1', text)
-    if icon_id is None:
+    # Resolve icon and prepend Unicode emoji to text so it always displays
+    _emoji_char = ''
+    if icon and not icon_id:
         icon_id = premium_icon(icon)
+    if icon:
+        _emoji_char = UNICODE_FALLBACKS.get(str(icon).lower(), '')
+        if _emoji_char and not text.startswith(_emoji_char):
+            text = f"{_emoji_char} {text}"
     kwargs = {"text": text}
     if copy_text_str:
         kwargs["callback_data"] = "fake_copy_btn"
@@ -279,8 +286,14 @@ def rbtn(text, style=None, icon=None, icon_id=None):
     # Fixed: Strip premium emoji HTML tags from button text
     if isinstance(text, str):
         text = _BTN_STRIP_RE.sub(r'\1', text)
-    if icon_id is None:
+    # Resolve icon and prepend Unicode emoji to text so it always displays
+    _emoji_char = ''
+    if icon and not icon_id:
         icon_id = premium_icon(icon)
+    if icon:
+        _emoji_char = UNICODE_FALLBACKS.get(str(icon).lower(), '')
+        if _emoji_char and not text.startswith(_emoji_char):
+            text = f"{_emoji_char} {text}"
     try:
         return types.KeyboardButton(text=text, style=style, icon_custom_emoji_id=icon_id)
     except TypeError:
