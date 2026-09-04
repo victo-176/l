@@ -3917,6 +3917,16 @@ def check_sub(call):
 def blocked_banned_user(message):
     bot.send_message(message.chat.id, "🚫 You are banned from this bot.", parse_mode="HTML")
 
+# ---- Global maintenance block ----
+# When maintenance is ON, non-admin users cannot use ANY command, button, or message type.
+# This handler is registered early so it intercepts everything before other handlers.
+@bot.message_handler(func=lambda msg: get_setting('maintenance') == '1' and not is_admin(msg.from_user.id), content_types=['text', 'photo', 'document', 'voice', 'video', 'video_note', 'sticker', 'audio', 'animation', 'contact', 'location'])
+def blocked_maintenance_user(message):
+    try:
+        bot.send_message(message.chat.id, "⚠️ <b>Bot is under maintenance.</b>\nPlease try again later.", parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Maintenance block send error: {e}")
+
 # ---- Text handlers ----
 @bot.message_handler(func=menu_match("GET NUMBER"))
 def get_number_handler(message):
