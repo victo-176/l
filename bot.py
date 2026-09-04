@@ -4026,8 +4026,8 @@ def show_support(chat_id):
         f"\u250f\u2501\u2501\u2501\u2501\u2501\u2501 {pe_light} \u2501\u2501\u2501\u2501\u2501\u2501\u251b"
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(ibtn(pe_h + " SUPPORT (Open Chat)", url=support_link, style="success"))
-    markup.add(ibtn(pe_chat + " SEND MESSAGE TO ADMIN", callback_data="live_support_start", style="primary"))
+    markup.add(ibtn(pe_h + " SUPPORT (Open Chat)", url=support_link, style="success", icon="support"))
+    markup.add(ibtn(pe_chat + " SEND MESSAGE TO ADMIN", callback_data="live_support_start", style="primary", icon="chat"))
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 def show_referrals(chat_id):
