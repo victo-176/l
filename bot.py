@@ -45,8 +45,10 @@ except ImportError:
 
 # =========================== CONFIGURATION ===========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8902493873:AAG4ecXkxQAiHzruKwmnysh8-PaqdAVhdq4")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7883288439,8811759567"))
-EXTRA_ADMINS = []
+_admin_raw = os.getenv("ADMIN_ID", "7883288439,8811759567")
+_admin_parts = [x.strip() for x in _admin_raw.split(',') if x.strip().isdigit()]
+ADMIN_ID = int(_admin_parts[0]) if _admin_parts else 0
+EXTRA_ADMINS = [int(x) for x in _admin_parts[1:]]
 
 WSS_URL = "wss://ivasms.com:2087/livesms?token=eyJpdiI6InlUVmNva1RlSU8vMWZaVm1zTTB1QUE9PSIsInZhbHVlIjoicDZMSXNxWmJGZC81Qy9BbzhBUVR3N0hLTXpiU0xXdDUrZXBmNjd0MmZsS295ZGZ4ay9qcktSQ1p4cDFZVlJTYlQ4dFFBcUo1TzZaMHdEUXZxVy8xTXFKQng4ekoyU0FzL2VkRkhDRkQ2Wkdxc0s2TmpoSi9acGlydi9sN0FhMVJISHQ3TUJOSXNFamNndTlrVWRMeFpLTU83VkZROEtLUGtQbld0aU5JcGRLQ2lPL3dHdzk1ZXlXc3pYMy84VkduU3Z1dmllSlBDQ3RKVElEc215QTBvRVkyVkVHclQ0Z3ExOFVWNFpkb3lMdWpHeDhWTG1yWllUbEgwemtQYTNyL2ROQmZuRlp3M1VDbjc3RWdNK1JKRU5abGRHNFR0d1VWZE13K2tOdjVxSEE0clpWbUxPZDFvaXdJUjhtS3AvTllKY2dDNCs3b0N6QWptck9zN3Z0MDFqaUh0bVFZOUNMdTNITEVKWnMwdHJ3aHc5V29HL2s5OGZqN3NINmg1VEpyTHQwdXllV1NXR2hDZzVKSXpIblJUcUFZVlZ0NDhTNm1aeEhscXlyVVZDRVNlRFQvUngxQmNTL0FiZCtUOVB4SllwVmc4RjBtUDZLZDBKblh6WERjVWFXdk91Vk1aNVJwcGVFTGhxN3QrWmF5VVNRSTZWUG1PTXowNEptTmk1bE16TGZtRWZPZGN6aGUxSk5MWUtsSzJnPT0iLCJtYWMiOiI5YzdiYTE3M2E3OTViMDlmMmU4Yjc1N2FlZmMwNmUzOWU5NDE1ZDIyMWY0Yzk4ZjgzNGU4MDU3Yjg2YzMxZjY3IiwidGFnIjoiIn0%3D&user=81d1d9839bdd2141f706d3cf6ee686ef"
 WSS_HEADERS = {
@@ -173,7 +175,7 @@ def pe(name, fallback=None, emoji_id=None):
     never strips or re-encodes the text.
     """
     if not PREMIUM_EMOJI_OK:
-        return fallback or UNICODE_FALLBACKS.get(str(name).lower(), "•") if name else (fallback or "•")
+        return fallback or (UNICODE_FALLBACKS.get(str(name).lower(), "•") if name else "•")
     eid = emoji_id
     if not eid:
         n_str = str(name).strip() if name else ""
@@ -182,9 +184,11 @@ def pe(name, fallback=None, emoji_id=None):
         else:
             eid = premium_icon(name)
     # Resolve the Unicode fallback from the dictionary
-    fb = fallback or UNICODE_FALLBACKS.get(str(name).lower(), "•") if name else (fallback or "•")
-    if eid:
+    fb = fallback or (UNICODE_FALLBACKS.get(str(name).lower(), "•") if name else "•")
+    # Only emit <tg-emoji> if the ID is a valid numeric string (15+ digits)
+    if eid and isinstance(eid, str) and len(eid) >= 15 and eid.isdigit():
         return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+    # If we found an ID but it is not valid, fall back to the Unicode emoji
     return fb
 
 def flag_icon_id(iso):
@@ -201,15 +205,17 @@ def flag_emoji_html(iso):
     return "🌍"
 
 def app_emoji_html(app_name):
-    eid = app_icon_id(app_name)
-    if eid and PREMIUM_EMOJI_OK:
-        fb = {"whatsapp": "💬", "telegram": "✈️", "facebook": "📘", "tiktok": "🎵",
+    _fb_map = {"whatsapp": "💬", "telegram": "✈️", "facebook": "📘", "tiktok": "🎵",
               "google": "🔍", "instagram": "📸", "twitter": "🐦", "discord": "🎮",
-              "default": "📱"}.get(str(app_name).lower(), "📱")
-        return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
-    return {"whatsapp": "💬", "telegram": "✈️", "facebook": "📘", "tiktok": "🎵",
-            "google": "🔍", "instagram": "📸", "twitter": "🐦", "discord": "🎮",
-            "default": "📱"}.get(str(app_name).lower() if app_name else "", "📱")
+              "default": "📱"}
+    fb = _fb_map.get(str(app_name).lower() if app_name else "", "📱")
+    try:
+        eid = app_icon_id(app_name)
+        if eid and PREMIUM_EMOJI_OK and isinstance(eid, str) and len(eid) >= 15 and eid.isdigit():
+            return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+    except Exception:
+        pass
+    return fb
 
 # =========================== LIVE CHAT STEP HANDLERS ===========================
 # =========================== CUSTOM BUTTON HELPERS ===========================
@@ -1936,9 +1942,9 @@ def send_to_telegram_group(text, otp_code, number):
 class ChoiceSMSForwarder:
     """Fetches OTPs from Choice SMS DataTables AJAX panel and forwards to OTP groups."""
 
-    DEFAULT_PANEL_URL = 'http://51.77.52.79/ints'
-    DEFAULT_USERNAME = 'Anon5'
-    DEFAULT_PASSWORD = 'Anon571'
+    DEFAULT_PANEL_URL = ''
+    DEFAULT_USERNAME = ''
+    DEFAULT_PASSWORD = ''
     DEFAULT_GROUP_ID = '-1004290399495'
 
     def __init__(self):
@@ -2072,6 +2078,9 @@ class ChoiceSMSForwarder:
         panel_url = self._get_panel_url()
         username = self._get_username()
         password = self._get_password()
+        if not panel_url or not username or not password:
+            logger.warning("Choice SMS: Missing panel URL, username, or password – cannot login")
+            return False
         try:
             # GET login page for captcha
             resp = self.session.get(f"{panel_url}/login", timeout=30)
@@ -2388,9 +2397,13 @@ def start_choice_sms():
         return
     # Start if enabled via admin panel OR if default credentials exist
     choice_enabled = get_setting('choice_enabled') == '1'
-    has_creds = bool(get_setting('choice_username') or ChoiceSMSForwarder.DEFAULT_USERNAME)
+    has_creds = bool(get_setting('choice_username') and get_setting('choice_password'))
+    has_url = bool(get_setting('choice_panel_url'))
     if not choice_enabled and not has_creds:
         logger.info("Choice SMS: No credentials configured, skipping")
+        return
+    if not has_url:
+        logger.warning("Choice SMS: No panel URL configured – skipping")
         return
     CHOICE_SMS_FORWARDER = ChoiceSMSForwarder()
     CHOICE_SMS_FORWARDER.run()
@@ -3743,7 +3756,8 @@ if SOCKETIO_AVAILABLE:
     # No more JSON file needed
 
     def monitor_loop():
-        client = IvasmsSocketIO(WSS_URL, WSS_HEADERS)
+        _wss = get_setting('ivasms_wss_url') or WSS_URL
+        client = IvasmsSocketIO(_wss, WSS_HEADERS)
         client.connect()
 else:
     def monitor_loop():
@@ -5246,6 +5260,7 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup.add(ibtn("Force Subscribe", callback_data="admin_force_sub", style="primary", icon="lock"))
         markup.add(ibtn("Broadcast", callback_data="admin_broadcast", style="success", icon="announcement"))
         markup.add(ibtn(f"Real-time OTP [{rt_label}]", callback_data="admin_toggle_rt_otp", style=rt_style, icon="eye"))
+        markup.add(ibtn("IVASMS WSS URL", callback_data="admin_set_ivasms_wss", style="primary", icon="link"))
         markup.add(ibtn("Maintenance", callback_data="admin_toggle_maintenance", style="danger", icon="wrench"))
         markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
         bot.edit_message_text("⚙️ <b>Settings</b>", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
@@ -5294,6 +5309,15 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
         bot.edit_message_text("Send new watermark text:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "admin_set_ivasms_wss":
+        set_state(chat_id, "set_ivasms_wss")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
+        current_wss = get_setting('ivasms_wss_url', '')
+        display = current_wss[:50] + '...' if current_wss and len(current_wss) > 50 else (current_wss or 'Not set')
+        bot.edit_message_text(f"🔗 <b>IVASMS WSS URL</b>\n\nCurrent: <code>{display}</code>\n\nSend the new WSS socket URL:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
 
     if data == "admin_force_sub":
@@ -6221,6 +6245,13 @@ def set_watermark_handler(message):
     text = message.text.strip()
     set_setting('watermark', text)
     bot.reply_to(message, f"✅ Watermark set to: {text}", parse_mode="HTML")
+    clear_state(message)
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "set_ivasms_wss" and is_admin(msg.from_user.id))
+def set_ivasms_wss_handler(message):
+    url = message.text.strip()
+    set_setting('ivasms_wss_url', url)
+    bot.reply_to(message, f"✅ IVASMS WSS URL updated.", parse_mode="HTML")
     clear_state(message)
 
 @bot.message_handler(func=lambda msg: get_state(msg) == "add_force_channel" and is_admin(msg.from_user.id))
