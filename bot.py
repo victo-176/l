@@ -50,11 +50,11 @@ _admin_parts = [x.strip() for x in _admin_raw.split(',') if x.strip().isdigit()]
 ADMIN_ID = int(_admin_parts[0]) if _admin_parts else 0
 EXTRA_ADMINS = [int(x) for x in _admin_parts[1:]]
 
-WSS_URL = "wss://ivasms.com:2087/livesms?token=eyJpdiI6InlUVmNva1RlSU8vMWZaVm1zTTB1QUE9PSIsInZhbHVlIjoicDZMSXNxWmJGZC81Qy9BbzhBUVR3N0hLTXpiU0xXdDUrZXBmNjd0MmZsS295ZGZ4ay9qcktSQ1p4cDFZVlJTYlQ4dFFBcUo1TzZaMHdEUXZxVy8xTXFKQng4ekoyU0FzL2VkRkhDRkQ2Wkdxc0s2TmpoSi9acGlydi9sN0FhMVJISHQ3TUJOSXNFamNndTlrVWRMeFpLTU83VkZROEtLUGtQbld0aU5JcGRLQ2lPL3dHdzk1ZXlXc3pYMy84VkduU3Z1dmllSlBDQ3RKVElEc215QTBvRVkyVkVHclQ0Z3ExOFVWNFpkb3lMdWpHeDhWTG1yWllUbEgwemtQYTNyL2ROQmZuRlp3M1VDbjc3RWdNK1JKRU5abGRHNFR0d1VWZE13K2tOdjVxSEE0clpWbUxPZDFvaXdJUjhtS3AvTllKY2dDNCs3b0N6QWptck9zN3Z0MDFqaUh0bVFZOUNMdTNITEVKWnMwdHJ3aHc5V29HL2s5OGZqN3NINmg1VEpyTHQwdXllV1NXR2hDZzVKSXpIblJUcUFZVlZ0NDhTNm1aeEhscXlyVVZDRVNlRFQvUngxQmNTL0FiZCtUOVB4SllwVmc4RjBtUDZLZDBKblh6WERjVWFXdk91Vk1aNVJwcGVFTGhxN3QrWmF5VVNRSTZWUG1PTXowNEptTmk1bE16TGZtRWZPZGN6aGUxSk5MWUtsSzJnPT0iLCJtYWMiOiI5YzdiYTE3M2E3OTViMDlmMmU4Yjc1N2FlZmMwNmUzOWU5NDE1ZDIyMWY0Yzk4ZjgzNGU4MDU3Yjg2YzMxZjY3IiwidGFnIjoiIn0%3D&user=81d1d9839bdd2141f706d3cf6ee686ef"
+WSS_URL = ""  # Admin sets via Settings > IVASMS WSS URL
 WSS_HEADERS = {
-    "Origin": "https://ivasms.com",
+    "Origin": "https://ivas.qzz.io",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.ivasms.com/",
+    "Referer": "https://ivas.qzz.io/",
 }
 
 ALLOWED_SERVICES = {
@@ -3770,6 +3770,10 @@ if SOCKETIO_AVAILABLE:
 
     def monitor_loop():
         _wss = get_setting('ivasms_wss_url') or WSS_URL
+        if not _wss:
+            logger.warning("IVASMS WSS URL not configured – OTP monitoring disabled. Set via Admin > Settings > IVASMS WSS URL")
+            while True:
+                time.sleep(60)
         client = IvasmsSocketIO(_wss, WSS_HEADERS)
         client.connect()
 else:
@@ -4628,7 +4632,7 @@ PREDEFINED_PANELS = [
     ("Hadi", "http://2.59.169.96/ints"),
     ("Hi SMS", "http://108.165.233.94"),
     ("IMS SMS", "https://imssms.org"),
-    ("Ivasms", "wss://ivasms.qzz.io:2087/socket.io/"),
+    ("Ivasms", "wss://ivas.qzz.io:2087/socket.io/"),
     ("KM SMS", "http://54.36.173.235/ints"),
     ("Konekta", "https://konektapremium.net"),
     ("Lamix", "http://139.99.208.63/ints"),
