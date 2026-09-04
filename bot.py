@@ -1783,19 +1783,17 @@ def force_sub_check(user_id):
             elif url.startswith("@"):
                 ch = url
             else:
-                continue
+                logger.error(f"[ForceSub] Unrecognized channel URL format: {url}")
+                return False
             member = bot.get_chat_member(ch, user_id)
             status = getattr(member, 'status', None)
-            if status in ["member", "administrator", "creator"]:
-                continue
-            else:
+            if status not in ("member", "administrator", "creator"):
                 return False
         except Exception as e:
-            # FIXED: Don't return False on exception -- bot might not be
-            # admin of the channel, or API rate-limit. Skip this channel
-            # so joined users aren't wrongly blocked.
-            logger.warning(f"Force sub check error for {url}: {e}")
-            continue
+            # FIXED: Treat any failure (ChatNotFound, BotNotAdmin, NetworkError,
+            # rate-limit) as NOT subscribed so users cannot bypass the check.
+            logger.error(f"[ForceSub] Check FAILED for {url} (user {user_id}): {type(e).__name__}: {e}")
+            return False
     return True
 
 def force_sub_markup():
@@ -3896,12 +3894,22 @@ def show_force_join(chat_id):
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def check_sub(call):
-    if force_sub_check(call.from_user.id):
-        bot.answer_callback_query(call.id, "✅ Verified!", show_alert=True)
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        show_main_menu(call.message.chat.id, call.from_user.id, call.from_user.first_name)
-    else:
-        bot.answer_callback_query(call.id, "❌ Not subscribed yet!", show_alert=True)
+    try:
+        if force_sub_check(call.from_user.id):
+            bot.answer_callback_query(call.id, "✅ Verified!", show_alert=True)
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            show_main_menu(call.message.chat.id, call.from_user.id, call.from_user.first_name)
+        else:
+            bot.answer_callback_query(call.id, "❌ Not subscribed yet! Join all channels and try again.", show_alert=True)
+    except Exception as e:
+        logger.error(f"[ForceSub] check_sub error: {e}")
+        try:
+            bot.answer_callback_query(call.id, "❌ Verification failed. Try again later.", show_alert=True)
+        except Exception:
+            pass
 
 # ---- Global banned user block ----
 # FIXED: Banned users cannot use ANY command or button
@@ -5437,7 +5445,7 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         set_state(chat_id, "admin_broadcast_msg")
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
-        bot.edit_message_text("📢 <b>Broadcast Message</b>\n\nSend the message you want to broadcast to all users:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        bot.edit_message_text("📢 <b>Broadcast Message</b>\n\nSend the message to broadcast to all users.\nSupported: text, photo, video, document, audio, voice, GIF, sticker.", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
 
     # === REAL-TIME OTP TOGGLE ===
@@ -6285,13 +6293,9 @@ def add_force_channel_handler(message):
 
 
 # ======================== BROADCAST ========================
-@bot.message_handler(func=lambda msg: get_state(msg) == "admin_broadcast_msg" and is_admin(msg.from_user.id))
+@bot.message_handler(func=lambda msg: get_state(msg) == "admin_broadcast_msg" and is_admin(msg.from_user.id), content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation', 'sticker', 'video_note'])
 def broadcast_handler(message):
-    """Admin broadcasts a message to all users with premium emojis."""
-    text = message.text.strip()
-    if not text:
-        bot.reply_to(message, "❌ Message cannot be empty.", parse_mode="HTML")
-        return
+    """Admin broadcasts ANY message type (text or media) to all users."""
     clear_state(message)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -6301,18 +6305,41 @@ def broadcast_handler(message):
     if not users:
         bot.reply_to(message, "❌ No users to broadcast to.", parse_mode="HTML")
         return
-    # Premium emoji broadcast message
-    broadcast_msg = (
-        f"{pe('announcement', '📢')} <b>{text}</b>"
-    )
+
+    caption = getattr(message, 'caption', None)
+
+    def _send(uid):
+        """Send the broadcast content to one user. Raises on failure."""
+        if message.content_type == 'text':
+            bot.send_message(uid, message.html_text or message.text, parse_mode="HTML")
+        elif message.content_type == 'photo':
+            bot.send_photo(uid, message.photo[-1].file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'video':
+            bot.send_video(uid, message.video.file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'document':
+            bot.send_document(uid, message.document.file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'audio':
+            bot.send_audio(uid, message.audio.file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'voice':
+            bot.send_voice(uid, message.voice.file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'animation':
+            bot.send_animation(uid, message.animation.file_id, caption=caption, parse_mode="HTML" if caption else None)
+        elif message.content_type == 'video_note':
+            bot.send_video_note(uid, message.video_note.file_id)
+        elif message.content_type == 'sticker':
+            bot.send_sticker(uid, message.sticker.file_id)
+        else:
+            bot.copy_message(uid, message.chat.id, message.message_id)
+
     sent = 0
     failed = 0
     for (uid,) in users:
         try:
-            bot.send_message(uid, broadcast_msg, parse_mode="HTML")
+            _send(uid)
             sent += 1
-        except:
+        except Exception as e:
             failed += 1
+            logger.warning(f"[Broadcast] Failed to send to {uid}: {e}")
     bot.reply_to(
         message,
         f"{pe('checkmark', '✅')} <b>Broadcast Sent!</b>\n\n"
