@@ -5350,7 +5350,7 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         set_state(chat_id, "set_ivasms_wss")
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
-        current_wss = get_setting('ivasms_wss_url', '')
+        current_wss = get_setting('ivasms_wss_url') or ''
         display = current_wss[:50] + '...' if current_wss and len(current_wss) > 50 else (current_wss or 'Not set')
         bot.edit_message_text(f"🔗 <b>IVASMS WSS URL</b>\n\nCurrent: <code>{display}</code>\n\nSend the new WSS socket URL:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
@@ -6606,8 +6606,14 @@ def main():
     except Exception as e:
         logger.error(f"Failed to start panel forwarders: {e}")
     logger.info("Forwarders started (IVASMS + Choice SMS + Panels + cleanup)")
+    # Clear any leftover webhook / stale poller state that causes 409 conflicts
+    try:
+        bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Webhook state cleared (no conflict with other pollers)")
+    except Exception as e:
+        logger.warning(f"delete_webhook failed (non-fatal): {e}")
     logger.info("Bot polling started.")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=20, long_polling_timeout=20)
 
 if __name__ == "__main__":
     try:
