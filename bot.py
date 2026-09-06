@@ -4558,6 +4558,10 @@ def _dispatch_callback(call, data, chat_id, msg_id, user_id):
             bot.register_next_step_handler_by_chat_id(chat_id, process_others_country)
         return
 
+    if data == "noop_btn":
+        bot.answer_callback_query(call.id)
+        return
+
     if data.startswith("usr_app|"):
         app = data.split("|")[1]
         show_user_countries(chat_id, app, msg_id)
@@ -4665,29 +4669,44 @@ def _show_number_display(chat_id, message_id, number, country_key, app_name, ext
     lines = []
     for n in held:
         disp = _strip_cc(n, country_key) if remove_cc else str(n)
-        lines.append(f"<code>{disp}</code>")
-    nums_block = "\n".join(lines)
+        lines.append(disp)
+    nums_list = lines if lines else [str(number)]
 
     # OTP group link from settings
     otp_link = get_setting('main_otp_link') or "https://t.me/THELIGHTSMS000"
+    # Website link from settings (optional)
+    website_link = get_setting('app_website_link') or get_setting('website_link') or ""
 
+    app_emoji = app_emoji_html(app_name)
+
+    # ---- Header text (reference layout) ----
     msg_text = (
-        f"🌍 <b>Country:</b> {country_name} ({iso})\n\n"
-        f"⏳ <b>Waiting for OTP</b>\n\n"
-        f"<b>{app_name}</b>\n"
-        f"Website Link\n"
-        f"{nums_block}"
+        f"🌐 <b>Country:</b> {flag_emoji_html(iso)} {country_name} ({iso})\n\n"
+        f"⏳ <b>Waiting for OTP</b>"
     )
 
-    markup = types.InlineKeyboardMarkup()
+    # ---- Buttons (reference layout) ----
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    # Row 1: App name button (non-clickable feel via no-op callback)
+    markup.add(ibtn(f"{app_emoji} {app_name}".strip(), callback_data="noop_btn", style="primary"))
+    # Row 2: Website Link (URL button) or fallback info button
+    if website_link:
+        markup.add(ibtn("🌐 Website Link", url=website_link, style="primary"))
+    else:
+        markup.add(ibtn("🌐 Website Link", callback_data="noop_btn", style="primary"))
+    # Rows 3+: one copy button per number
+    for disp in nums_list:
+        markup.add(ibtn(f"📋 {disp}", copy_text_str=str(disp), style="success"))
+    # Row: Change Number | OTP Group
     markup.row(
         ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger"),
         ibtn("OTP Group", url=otp_link, style="primary"),
     )
-    markup.row(
-        ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success"),
-        ibtn("Back", callback_data="close_menu", style="danger"),
-    )
+    # Row: ADD CC full width
+    markup.add(ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success"))
+    # Row: Back full width
+    markup.add(ibtn("Back", callback_data="close_menu", style="danger"))
+
     bot.edit_message_text(msg_text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
 
 def fetch_number_logic(chat_id, app_name, country_key, message_id):
