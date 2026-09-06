@@ -525,6 +525,10 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('num_per_request', '1')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('otp_price', '0.005')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('maintenance', '0')")
+        # NEW: Global withdrawal limits (REAL, stored as strings in bot_settings)
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('min_withdraw', '1.0')")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('max_withdraw', '5.0')")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('main_otp_link', 'https://t.me/THELIGHTSMS000')")
         # Ensure no duplicate numbers across users (migration for existing DBs)
         try:
             c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
@@ -602,6 +606,138 @@ def init_db():
         logger.info("Database initialized")
 
 init_db()
+
+# ======================== BACKUP / RESTORE (NEW) ========================
+BACKUP_FILE = os.path.join(PERSISTENT_DIR, "backup_light_premium.json")
+
+# All tables included in the one-click backup
+BACKUP_TABLES = [
+    'users', 'combos', 'otp_logs', 'referrals', 'withdrawals',
+    'admins', 'methods', 'bot_settings', 'private_combos',
+    'force_sub_channels', 'user_activity', 'response_times',
+    'balances', 'leaderboard', 'traffic_log', 'withdrawal_requests',
+    'otp_counts', 'seen_otps', 'sms_panels',
+    'broadcasts', 'admin_logs', 'group_settings',
+    'number_history', 'blacklist', 'bulk_operations'
+]
+
+def backup_all_tables():
+    """Dump all SQLite tables into a single JSON file inside PERSISTENT_DIR.
+    Returns (path, row_counts_dict) or raises on failure."""
+    data = {}
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        for table in BACKUP_TABLES:
+            try:
+                rows = c.execute(f"SELECT * FROM {table}").fetchall()
+                data[table] = [dict(r) for r in rows]
+            except Exception as e:
+                logger.warning(f"Backup: could not read table {table}: {e}")
+                data[table] = []
+        conn.close()
+    tmp = BACKUP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, default=str)
+    os.replace(tmp, BACKUP_FILE)
+    return BACKUP_FILE, {t: len(v) for t, v in data.items()}
+
+def restore_from_backup():
+    """Restore all tables from backup JSON. Clears each table first.
+    Returns (True, summary_str) on success, (False, error_str) on failure."""
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("Backup file has invalid structure")
+    except Exception as e:
+        return False, f"Backup file unreadable/corrupted: {e}"
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            restored = {}
+            for table in BACKUP_TABLES:
+                rows = data.get(table)
+                if rows is None:
+                    continue
+                c.execute(f"DELETE FROM {table}")
+                count = 0
+                for row in rows:
+                    if not isinstance(row, dict) or not row:
+                        continue
+                    cols = list(row.keys())
+                    ph = ", ".join("?" for _ in cols)
+                    try:
+                        c.execute(f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({ph})",
+                                  tuple(row[k] for k in cols))
+                        count += 1
+                    except Exception as row_err:
+                        logger.warning(f"Restore: skipped row in {table}: {row_err}")
+                restored[table] = count
+            conn.commit()
+            summary = ", ".join(f"{t}:{n}" for t, n in restored.items())
+            return True, summary
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+def auto_restore_if_empty():
+    """On startup: if the users table is empty and a backup file exists, restore it."""
+    try:
+        if not os.path.exists(BACKUP_FILE):
+            return
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        empty = (c.fetchone()[0] or 0) == 0
+        conn.close()
+        if not empty:
+            logger.info("Backup restore skipped: DB already has data")
+            return
+        logger.info("DB is empty and backup file found — restoring...")
+        ok, info = restore_from_backup()
+        if ok:
+            logger.info(f"Auto-restore complete: {info}")
+            try:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"💾 <b>Auto-Restore Complete</b>\n\nDatabase was empty — restored from backup.\n<code>{info}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            logger.error(f"Auto-restore FAILED: {info}")
+            try:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"🚨 <b>Auto-Restore Failed!</b>\n\n<code>{info}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"auto_restore_if_empty error: {e}")
+
+def get_withdraw_limits():
+    """Load min/max withdrawal from DB settings (defaults 1.0 / 5.0)."""
+    try:
+        mn = float(get_setting('min_withdraw') or 1.0)
+    except (TypeError, ValueError):
+        mn = 1.0
+    try:
+        mx = float(get_setting('max_withdraw') or 5.0)
+    except (TypeError, ValueError):
+        mx = 5.0
+    if mn <= 0:
+        mn = 1.0
+    if mx < mn:
+        mx = mn
+    return mn, mx
 
 # =========================== SEEN OTP HELPERS (DB-backed deduplication) ===========================
 
@@ -1882,28 +2018,30 @@ def send_otp_to_user_and_group(date_str, number, sms, app_name=None):
         logger.debug(f"Real-time OTP to admin failed: {rt_err}")
 
 def format_message(date_str, number, sms, flag_html, app_emoji):
-    masked = mask_number(number)
+    """Group OTP message in THE LIGHT format (NEW layout)."""
     otp = extract_otp(sms)
-    service_name = detect_service(sms).upper()
-    msg_text = sms[:200] if sms else ""
-    # Strip disclaimer text from SMS - be aggressive, remove any occurrence
-    msg_text = re.sub(r"(?i)Don'?t\s+share\s+this\s+code\s+with\s+others\.?", '', msg_text).strip()
+    country_name, iso, _ = get_country_info(number)
+    # service passed via detect_service; lowercase per screenshot
+    service_name = detect_service(sms).lower() if sms else "unknown"
+    # Full (unmasked) number per screenshot
+    phone = str(number)
+    flag_unicode = flag_emoji_html(iso)  # premium/unicode flag
+
+    # Cleaned SMS text (strip common disclaimers), first 300 chars
+    msg_text = sms[:300] if sms else ""
+    msg_text = re.sub(r"(?i)Don'?t\s+share\s+(this|your)\s+(confirmation\s+)?code\s+with\s+(others|anyone)\.?", '', msg_text).strip()
     msg_text = re.sub(r"(?i)please\s+do\s+not\s+disclose\s+it\s+to\s+anyone\.?", '', msg_text).strip()
     msg_text = re.sub(r"(?i)disclose\s+it\s+to\s+anyone\.?", '', msg_text).strip()
-    msg_text = re.sub(r"\s+", ' ', msg_text).strip()  # collapse multiple spaces
-    # Format OTP with hyphen if 6 digits
-    otp_display = otp
-    if len(otp) == 6:
-        otp_display = f"{otp[:3]}-{otp[3:]}"
+    msg_text = re.sub(r"\s+", ' ', msg_text).strip()
+
     return (
-        f"<b>THE-LIGHT</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{flag_html} <b>{service_name}</b> 🟢\n"
-        f"📱 <code>{masked}</code>\n"
-        f"🔑 <b>OTP:</b> <code>{otp_display}</code>\n"
-        f"📩 <b>Message:</b> <code>{msg_text[:200]}</code>\n"
-        f"⏰ {date_str}\n"
-        f"━━━━━━━━━━━━━━━"
+        f"<b>{country_name} {service_name} OTP Received!</b> \U0001f970\n\n"
+        f"Time: {date_str}\n"
+        f"Country: {country_name} {flag_unicode}\n"
+        f"Service: {service_name}\n"
+        f"Number: {phone}\n"
+        f"OTP: <b>{otp}</b>\n\n"
+        f"Full Message:\n{msg_text}"
     )
 
 def send_to_telegram_group(text, otp_code, number):
@@ -4090,6 +4228,16 @@ def show_referrals(chat_id):
 
 # ---- Withdrawals ----
 def start_withdrawal(chat_id):
+    # NEW: Block withdrawal entirely if balance is below min_withdraw
+    try:
+        min_w, _max_w = get_withdraw_limits()
+        user = get_user(chat_id)
+        balance = user[10] if user and len(user) > 10 and user[10] is not None else 0.0
+        if balance < min_w:
+            bot.send_message(chat_id, f"\u274c <b>Withdrawal Unavailable</b>\n\nYour balance (${balance:.2f}) is below the minimum withdrawal of ${min_w:.2f}.", parse_mode="HTML")
+            return
+    except Exception as e:
+        logger.warning(f"withdraw min-balance check failed: {e}")
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(ibtn("Opay (10‑digit phone)", callback_data="withdraw_method|opay", style="success", icon="card"))
     markup.add(ibtn("USDT (BEP20 address)", callback_data="withdraw_method|usdt", style="primary", icon="dollar"))
@@ -4288,37 +4436,52 @@ def _strip_cc(number, country_key):
     return str(number)
 
 def _show_number_display(chat_id, message_id, number, country_key, app_name, extra_numbers=None):
-    """Display the assigned number(s) with CC toggle and other buttons."""
-    country_name = COUNTRY_CODES.get(country_key, (country_key, "Unknown"))[0]
+    """Display the assigned number(s) in the AK NUMBER BOT card format (NEW)."""
+    country_name = COUNTRY_CODES.get(country_key, (country_key, "Unknown"))[0].upper()
     iso = COUNTRY_CODES.get(country_key, (country_key, "UN"))[1]
     flag = flag_emoji_html(iso)
     svc = app_emoji_html(app_name)
 
-    remove_cc = get_remove_cc(chat_id)
-    if remove_cc:
-        display_number = _strip_cc(number, country_key)
-        cc_btn_text = "🌍 CC ON"
+    # Build the number list (all assigned numbers, one per line)
+    if extra_numbers:
+        # extra_numbers already contains bullet lines; rebuild as plain code lines
+        all_nums = [number]
+        try:
+            u = get_user(chat_id)
+            if u and len(u) > 5 and u[5]:
+                all_nums = [n.strip() for n in u[5].split(",") if n.strip()]
+        except Exception:
+            pass
     else:
-        display_number = f"+{number}"
-        cc_btn_text = "🌍 CC"
+        all_nums = [number]
+
+    remove_cc = get_remove_cc(chat_id)
+    lines = []
+    for n in all_nums:
+        disp = _strip_cc(n, country_key) if remove_cc else f"+{n}"
+        lines.append(f"<code>{disp}</code>")
+    nums_block = "\n".join(lines)
+
+    # OTP group link from settings
+    otp_link = get_setting('main_otp_link') or "https://t.me/THELIGHTSMS000"
 
     msg_text = (
-        f"📞 <b>Number:</b> <code>{display_number}</code>\n"
-        f"{flag} <b>Country:</b> {country_name}\n"
-        f"{svc} <b>Service:</b> {app_name}\n"
-        f"⏳ <b>Status:</b> Waiting for SMS"
+        f"{flag} <b>Country:</b> {country_name} ({iso})\n"
+        f"\u23f3 <b>Waiting for OTP</b>\n"
+        f"{svc} <b>{app_name}</b>\n"
+        f"\U0001f310 Website Link\n"
+        f"{nums_block}"
     )
-    # Fixed: Show extra numbers if num_per_request > 1
-    if extra_numbers:
-        msg_text += f"\n\n📋 <b>All Assigned Numbers:</b>\n{extra_numbers}"
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(ibtn("View OTP", url="https://t.me/THELIGHTSMS000", style="primary", icon="eye"))
     markup.row(
-        ibtn(cc_btn_text, callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
-        ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
+        ibtn("\U0001f504 Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
+        ibtn("OTP Group", url=otp_link, style="primary", icon="announcement"),
     )
-    markup.row(ibtn("Back", callback_data="close_menu", style="primary", icon="back"))
+    markup.row(
+        ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
+        ibtn("Back", callback_data="close_menu", style="primary", icon="back"),
+    )
     bot.edit_message_text(msg_text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
 
 def fetch_number_logic(chat_id, app_name, country_key, message_id):
@@ -4433,11 +4596,13 @@ def check_withdrawal_amount(user_id, amount):
     user = get_user(user_id)
     balance = user[10] if user and len(user) > 10 else 0.0
     if amount > balance:
-        return f"❌ Insufficient balance. You have ${balance}."
-    if amount < MIN_WITHDRAWAL:
-        return f"❌ Minimum withdrawal is ${MIN_WITHDRAWAL:.2f}."
-    if amount > MAX_WITHDRAWAL:
-        return f"❌ Maximum withdrawal is ${MAX_WITHDRAWAL:.2f}."
+        return f"❌ Insufficient balance. You have ${balance:.2f}."
+    # NEW: enforce min/max withdrawal limits from DB settings
+    min_w, max_w = get_withdraw_limits()
+    if balance < min_w:
+        return f"❌ Your balance (${balance:.2f}) is below the minimum withdrawal of ${min_w:.2f}."
+    if amount < min_w or amount > max_w:
+        return f"❌ Withdrawal amount must be between ${min_w:.2f} and ${max_w:.2f}."
     return None
 
 def process_opay_amount(message):
@@ -4736,6 +4901,8 @@ def get_admin_menu():
         ibtn("Choice SMS", callback_data="admin_choice_sms", style="primary", icon="link"),
         ibtn("Settings", callback_data="admin_settings", style="danger", icon="settings"),
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
+        ibtn("💾 Backup", callback_data="admin_backup", style="success", icon="archive"),
+        ibtn("👤 View Member", callback_data="admin_view_member", style="primary", icon="profile"),
         ibtn("Leave", callback_data="close_menu", style="danger", icon="back")
     ]
     for i in range(0, len(buttons), 2):
@@ -5296,6 +5463,8 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup.add(ibtn("Broadcast", callback_data="admin_broadcast", style="success", icon="announcement"))
         markup.add(ibtn(f"Real-time OTP [{rt_label}]", callback_data="admin_toggle_rt_otp", style=rt_style, icon="eye"))
         markup.add(ibtn("IVASMS WSS URL", callback_data="admin_set_ivasms_wss", style="primary", icon="link"))
+        markup.add(ibtn(f"\u0024 Min Withdraw (${get_withdraw_limits()[0]:.2f})", callback_data="admin_set_min_withdraw", style="primary", icon="dollar"))
+        markup.add(ibtn(f"\u0024 Max Withdraw (${get_withdraw_limits()[1]:.2f})", callback_data="admin_set_max_withdraw", style="primary", icon="dollar"))
         markup.add(ibtn("Maintenance", callback_data="admin_toggle_maintenance", style="danger", icon="wrench"))
         markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
         bot.edit_message_text("⚙️ <b>Settings</b>", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
@@ -5344,6 +5513,69 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
         bot.edit_message_text("Send new watermark text:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: View Member - full member details with add/deduct balance buttons
+    if data == "admin_view_member":
+        set_state(chat_id, "view_member_lookup")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text("👤 <b>VIEW MEMBER</b>\n\nSend the User ID or @username:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("vm_addbal|"):
+        uid = data.split("|")[1]
+        set_state(chat_id, {"vm_balance_target": uid})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text(f"💰 <b>ADD BALANCE</b>\n\nUser: <code>{uid}</code>\n\nSend the amount to ADD (e.g. 1.50):", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("vm_deduct|"):
+        uid = data.split("|")[1]
+        set_state(chat_id, {"vm_deduct_target": uid})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text(f"💸 <b>DEDUCT BALANCE</b>\n\nUser: <code>{uid}</code>\n\nSend the amount to DEDUCT (e.g. 0.50):", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: Admin sets min/max withdrawal limits (stored in bot_settings)
+    if data == "admin_set_min_withdraw":
+        set_state(chat_id, "set_min_withdraw")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
+        bot.edit_message_text(f"\u0024 <b>SET MIN WITHDRAW</b>\n\nCurrent: <code>${get_withdraw_limits()[0]:.2f}</code>\n\nSend a positive numeric value:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "admin_set_max_withdraw":
+        set_state(chat_id, "set_max_withdraw")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
+        bot.edit_message_text(f"\u0024 <b>SET MAX WITHDRAW</b>\n\nCurrent: <code>${get_withdraw_limits()[1]:.2f}</code>\n\nSend a positive numeric value:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: One-click backup - dumps all tables to backup_light_premium.json
+    if data == "admin_backup":
+        try:
+            path, counts = backup_all_tables()
+            size_kb = os.path.getsize(path) / 1024
+            total_rows = sum(counts.values())
+            text = (f"\u2705 <b>Backup Complete</b>\n\n"
+                    f"\U0001f4e6 File: <code>backup_light_premium.json</code>\n"
+                    f"\U0001f4be Size: <code>{size_kb:.1f} KB</code>\n"
+                    f"\U0001f4ca Total rows: <code>{total_rows}</code>\n\n")
+            for t, n in counts.items():
+                if n:
+                    text += f"\u2022 {t}: {n}\n"
+            with open(path, "rb") as f:
+                bot.send_document(chat_id, f, caption=text, parse_mode="HTML")
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Backup failed: {e}")
+            bot.answer_callback_query(call.id, f"\u274c Backup failed: {e}", show_alert=True)
         return
 
     if data == "admin_set_ivasms_wss":
@@ -6289,6 +6521,208 @@ def set_ivasms_wss_handler(message):
     bot.reply_to(message, f"✅ IVASMS WSS URL updated.", parse_mode="HTML")
     clear_state(message)
 
+# ======================== VIEW MEMBER HANDLERS (NEW) ========================
+@bot.message_handler(func=lambda msg: get_state(msg) == "view_member_lookup" and is_admin(msg.from_user.id))
+def view_member_lookup_handler(message):
+    q = message.text.strip()
+    clear_state(message)
+    uid = None
+    if q.lstrip("@").isdigit():
+        uid = int(q)
+    elif q.startswith("@"):
+        uname = q.lstrip("@").lower()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE LOWER(username)=?", (uname,))
+        r = c.fetchone()
+        conn.close()
+        uid = r[0] if r else None
+    if uid is None:
+        bot.reply_to(message, "\u274c User not found. Send a numeric User ID or @username.", parse_mode="HTML")
+        return
+    _send_member_report(chat_id=message.chat.id, user_id=uid)
+
+def _send_member_report(chat_id, user_id):
+    """Build and send the detailed member report (NEW)."""
+    try:
+        user = get_user(user_id)
+        if not user:
+            bot.send_message(chat_id, f"\u274c User <code>{user_id}</code> not found.", parse_mode="HTML")
+            return
+        # users columns: 0=user_id,1=username,2=first_name,3=last_name,4=country_code,
+        # 5=assigned_number,6=is_banned,7=private_combo_country,8=join_date,9=last_active,10=balance,11=remove_cc
+        username = user[1] or ""
+        first_name = user[2] or ""
+        country_code = user[4] or "N/A"
+        assigned = user[5] or ""
+        is_banned = "Yes" if user[6] else "No"
+        join_date = user[8] or "N/A"
+        last_active = user[9] or "N/A"
+        balance = user[10] if user[10] is not None else 0.0
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Financial
+        c.execute("SELECT COUNT(*) FROM otp_logs WHERE assigned_to=?", (user_id,))
+        total_otps = c.fetchone()[0] or 0
+        c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE user_id=? AND status='approved'", (user_id,))
+        total_withdrawn = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE user_id=? AND status='pending'", (user_id,))
+        pending_wd = c.fetchone()[0] or 0
+        # Referrals
+        c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,))
+        ref_count = c.fetchone()[0] or 0
+        ref_earned = ref_count * REFERRAL_REWARD
+        # Assigned numbers (may be comma-separated)
+        numbers = [n.strip() for n in assigned.split(",") if n.strip()] if assigned else []
+        # Active sessions from number_history (released_at IS NULL = active)
+        c.execute("SELECT number, country_code, assigned_at FROM number_history WHERE user_id=? AND released_at IS NULL ORDER BY id DESC LIMIT 10", (user_id,))
+        active_sessions = c.fetchall()
+        # Recent activity (last 5)
+        c.execute("SELECT action, details, timestamp FROM user_activity WHERE user_id=? ORDER BY id DESC LIMIT 5", (user_id,))
+        activity = c.fetchall()
+        # Recent OTPs (last 5)
+        c.execute("SELECT timestamp, number, otp, service FROM otp_logs WHERE assigned_to=? ORDER BY id DESC LIMIT 5", (user_id,))
+        otps = c.fetchall()
+        conn.close()
+
+        display_name = first_name or (f"@{username}" if username else str(user_id))
+        text = f"\U0001f464 <b>MEMBER REPORT</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        text += f"\U0001f194 ID: <code>{user_id}</code>\n"
+        text += f"\U0001f4db Name: {display_name}\n"
+        text += f"\U0001f464 Username: @{username if username else 'N/A'}\n"
+        text += f"\U0001f30d Country: {country_code}\n"
+        text += f"\U0001f4c5 Joined: {join_date}\n"
+        text += f"\u23f0 Last Active: {last_active}\n"
+        text += f"\U0001f6ab Banned: {is_banned}\n"
+        text += f"\n\U0001f4b0 <b>FINANCIAL</b>\n"
+        text += f"\U0001f4b0 Balance: <b>${balance:.2f}</b>\n"
+        text += f"\U0001f4f2 Total OTPs: {total_otps}\n"
+        text += f"\U0001f4b5 Total Withdrawn: ${total_withdrawn:.2f}\n"
+        text += f"\u23f3 Pending Withdrawals: {pending_wd}\n"
+        text += f"\n\U0001f91d <b>REFERRALS</b>\n"
+        text += f"\U0001f465 Count: {ref_count}\n"
+        text += f"\U0001f4b0 Earned: ${ref_earned:.2f}\n"
+        text += f"\n\U0001f4f1 <b>ASSIGNED NUMBERS</b>\n"
+        if numbers:
+            for n in numbers:
+                text += f"\U0001f4de <code>{n}</code>\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f504 <b>ACTIVE SESSIONS</b>\n"
+        if active_sessions:
+            for num, cc, ts in active_sessions:
+                text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) since {ts}\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f4cb <b>RECENT ACTIVITY</b>\n"
+        if activity:
+            for action, details, ts in activity:
+                text += f"\u2022 {action} \u2014 {str(details or '')[:40]} ({ts})\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f511 <b>RECENT OTPS</b>\n"
+        if otps:
+            for ts, num, otp, svc in otps:
+                text += f"\u2022 <code>{num}</code> \u2192 <b>{otp}</b> ({svc or 'N/A'}) {ts}\n"
+        else:
+            text += "None\n"
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            ibtn("\u2795 Add Balance", callback_data=f"vm_addbal|{user_id}", style="success", icon="plus"),
+            ibtn("\u2796 Deduct Balance", callback_data=f"vm_deduct|{user_id}", style="danger", icon="minus"),
+        )
+        markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"_send_member_report error: {e}")
+        bot.send_message(chat_id, f"\u274c Error building report: {e}", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and "vm_balance_target" in get_state(msg) and is_admin(msg.from_user.id))
+def vm_add_balance_handler(message):
+    st = get_state(message)
+    uid = int(st["vm_balance_target"])
+    clear_state(message)
+    try:
+        amt = float(message.text.strip().replace("$", ""))
+        if amt <= 0:
+            raise ValueError
+        user = get_user(uid)
+        if not user:
+            bot.reply_to(message, "\u274c User not found.", parse_mode="HTML")
+            return
+        current = user[10] if len(user) > 10 and user[10] is not None else 0.0
+        new_bal = current + amt
+        save_user(uid, balance=new_bal)
+        bot.reply_to(message, f"\u2705 Added ${amt:.2f} to user <code>{uid}</code>. New balance: ${new_bal:.2f}", parse_mode="HTML")
+        try:
+            bot.send_message(uid, f"\U0001f4b0 <b>Balance Updated</b>\n+${amt:.2f}\nNew balance: ${new_bal:.2f}", parse_mode="HTML")
+        except Exception:
+            pass
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid amount.", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and "vm_deduct_target" in get_state(msg) and is_admin(msg.from_user.id))
+def vm_deduct_balance_handler(message):
+    st = get_state(message)
+    uid = int(st["vm_deduct_target"])
+    clear_state(message)
+    try:
+        amt = float(message.text.strip().replace("$", ""))
+        if amt <= 0:
+            raise ValueError
+        user = get_user(uid)
+        if not user:
+            bot.reply_to(message, "\u274c User not found.", parse_mode="HTML")
+            return
+        current = user[10] if len(user) > 10 and user[10] is not None else 0.0
+        if amt > current:
+            bot.reply_to(message, f"\u274c User has only ${current:.2f}.", parse_mode="HTML")
+            return
+        new_bal = current - amt
+        save_user(uid, balance=new_bal)
+        bot.reply_to(message, f"\u2705 Deducted ${amt:.2f} from user <code>{uid}</code>. New balance: ${new_bal:.2f}", parse_mode="HTML")
+        try:
+            bot.send_message(uid, f"\U0001f4b0 <b>Balance Updated</b>\n-${amt:.2f}\nNew balance: ${new_bal:.2f}", parse_mode="HTML")
+        except Exception:
+            pass
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid amount.", parse_mode="HTML")
+
+# ======================== SET MIN/MAX WITHDRAW HANDLERS (NEW) ========================
+@bot.message_handler(func=lambda msg: get_state(msg) == "set_min_withdraw" and is_admin(msg.from_user.id))
+def set_min_withdraw_handler(message):
+    try:
+        val = float(message.text.strip().replace("$", ""))
+        if val <= 0:
+            raise ValueError
+        max_w = get_withdraw_limits()[1]
+        if val > max_w:
+            bot.reply_to(message, f"\u274c Min withdraw (${val:.2f}) cannot be greater than max withdraw (${max_w:.2f}).", parse_mode="HTML")
+            return
+        set_setting('min_withdraw', str(val))
+        bot.reply_to(message, f"\u2705 Min withdraw set to <b>${val:.2f}</b>", parse_mode="HTML")
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid number. Send a positive value, e.g. 1.00", parse_mode="HTML")
+    clear_state(message)
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "set_max_withdraw" and is_admin(msg.from_user.id))
+def set_max_withdraw_handler(message):
+    try:
+        val = float(message.text.strip().replace("$", ""))
+        if val <= 0:
+            raise ValueError
+        min_w = get_withdraw_limits()[0]
+        if val < min_w:
+            bot.reply_to(message, f"\u274c Max withdraw (${val:.2f}) cannot be less than min withdraw (${min_w:.2f}).", parse_mode="HTML")
+            return
+        set_setting('max_withdraw', str(val))
+        bot.reply_to(message, f"\u2705 Max withdraw set to <b>${val:.2f}</b>", parse_mode="HTML")
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid number. Send a positive value, e.g. 5.00", parse_mode="HTML")
+    clear_state(message)
+
 @bot.message_handler(func=lambda msg: get_state(msg) == "add_force_channel" and is_admin(msg.from_user.id))
 def add_force_channel_handler(message):
     url = message.text.strip()
@@ -6589,6 +7023,11 @@ def periodic_cleanup():
             logger.error(f"Periodic cleanup error: {e}")
 
 def main():
+    # NEW: Auto-restore from backup if DB is empty
+    try:
+        auto_restore_if_empty()
+    except Exception as e:
+        logger.error(f"Auto-restore failed: {e}")
     # Log DB status on startup
     try:
         otp_count = get_total_otp_count()
