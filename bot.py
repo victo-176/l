@@ -385,7 +385,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS private_combos (
             user_id INTEGER, country_code TEXT, numbers TEXT,
-            PRIMARY KEY (user_id, country_code)
+            app_name TEXT DEFAULT 'WhatsApp',
+            PRIMARY KEY (user_id, country_code, app_name)
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS force_sub_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,13 +566,41 @@ def init_db():
         if "remove_cc" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN remove_cc INTEGER DEFAULT 0")
 
+        # FIXED (app filtering): add app_name to private_combos for existing DBs
+        pc_cols = [r[1] for r in c.execute("PRAGMA table_info(private_combos)")]
+        if "app_name" not in pc_cols:
+            c.execute("ALTER TABLE private_combos ADD COLUMN app_name TEXT DEFAULT 'WhatsApp'")
+            logger.info("Migrated private_combos: added app_name column")
+
+        # NEW (app filtering): app ownership table for assigned numbers
+        c.execute("""CREATE TABLE IF NOT EXISTS number_app_assignments (
+            number TEXT PRIMARY KEY,
+            user_id INTEGER,
+            app_name TEXT,
+            country_code TEXT,
+            assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        # Migration: rebuild ownership rows from users.assigned_number on startup
+        try:
+            c.execute("SELECT user_id, assigned_number, country_code FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
+            for uid, anum, cc in c.fetchall():
+                for n in str(anum).split(','):
+                    n = n.strip()
+                    if not n:
+                        continue
+                    app = get_app_for_number(n) or "WhatsApp"
+                    c.execute("INSERT OR REPLACE INTO number_app_assignments (number, user_id, app_name, country_code) VALUES (?, ?, ?, ?)",
+                              (n, uid, app, cc or ''))
+        except Exception as mig_err:
+            logger.warning(f"number_app_assignments migration warning: {mig_err}")
+
         # === Startup health check: verify all tables exist ===
         required_tables = [
             'users', 'combos', 'otp_logs', 'referrals', 'withdrawals',
             'admins', 'methods', 'bot_settings', 'private_combos',
             'force_sub_channels', 'user_activity', 'response_times',
             'balances', 'leaderboard', 'traffic_log', 'withdrawal_requests',
-            'otp_counts', 'seen_otps', 'sms_panels',
+            'otp_counts', 'seen_otps', 'sms_panels', 'number_app_assignments',
             'broadcasts', 'admin_logs', 'group_settings',
             'number_history', 'blacklist', 'bulk_operations'
         ]
@@ -616,7 +645,7 @@ BACKUP_TABLES = [
     'admins', 'methods', 'bot_settings', 'private_combos',
     'force_sub_channels', 'user_activity', 'response_times',
     'balances', 'leaderboard', 'traffic_log', 'withdrawal_requests',
-    'otp_counts', 'seen_otps', 'sms_panels',
+    'otp_counts', 'seen_otps', 'sms_panels', 'number_app_assignments',
     'broadcasts', 'admin_logs', 'group_settings',
     'number_history', 'blacklist', 'bulk_operations'
 ]
@@ -1038,26 +1067,42 @@ def get_user_by_number(number):
         conn.close()
         return row[0]
     # Try fuzzy: get all assigned numbers and check if any is a suffix/prefix match
+    # FIXED: comma-lists (multi-number users) are split and checked per number
     c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
-    for uid, anum in c.fetchall():
-        clean_anum = re.sub(r'\D', '', str(anum))
-        if not clean_anum:
-            continue
-        # Check if one contains the other (for country code differences)
-        if clean.endswith(clean_anum) or clean_anum.endswith(clean):
-            conn.close()
-            return uid
-        if clean.startswith(clean_anum) or clean_anum.startswith(clean):
-            # Only match if the remaining part is at least 5 digits
-            diff = abs(len(clean) - len(clean_anum))
-            if diff >= 0 and min(len(clean), len(clean_anum)) >= 5:
+    for uid, anum_raw in c.fetchall():
+        for anum in str(anum_raw).split(','):
+            clean_anum = re.sub(r'\D', '', str(anum))
+            if not clean_anum:
+                continue
+            if clean == clean_anum:
                 conn.close()
                 return uid
+            # Check if one contains the other (for country code differences)
+            if clean.endswith(clean_anum) or clean_anum.endswith(clean):
+                conn.close()
+                return uid
+            if clean.startswith(clean_anum) or clean_anum.startswith(clean):
+                # Only match if the remaining part is at least 5 digits
+                diff = abs(len(clean) - len(clean_anum))
+                if diff >= 0 and min(len(clean), len(clean_anum)) >= 5:
+                    conn.close()
+                    return uid
     conn.close()
     return None
 
 def get_app_for_number(number):
-    """Look up which app a phone number is assigned to from combos."""
+    """Look up which app a phone number is assigned to (ownership table first, then combos)."""
+    try:
+        # NEW: check explicit ownership first (assigned numbers always know their app)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT app_name FROM number_app_assignments WHERE number=?", (str(number),))
+        r = c.fetchone()
+        conn.close()
+        if r and r[0]:
+            return r[0]
+    except Exception as e:
+        logger.debug(f"get_app_for_number ownership lookup error: {e}")
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1106,18 +1151,78 @@ def get_price_for_number(number):
         logger.debug(f"get_price_for_number error: {e}")
     return None
 
+# ======================== NUMBER APP OWNERSHIP (NEW - app filtering fix) ========================
+def set_number_app(number, user_id, app_name, country_code=""):
+    """Record which app a user's assigned number belongs to."""
+    if not number:
+        return
+    try:
+        with _db_lock:
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO number_app_assignments (number, user_id, app_name, country_code, assigned_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                      (str(number), user_id, app_name or "WhatsApp", country_code or ""))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"set_number_app error for {number}: {e}")
+
+def get_numbers_for_user_app(user_id, app_name):
+    """All numbers currently assigned to user for the given app."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT number FROM number_app_assignments WHERE user_id=? AND app_name=? ORDER BY assigned_at",
+                  (user_id, app_name))
+        nums = [r[0] for r in c.fetchall()]
+        conn.close()
+        return nums
+    except Exception as e:
+        logger.error(f"get_numbers_for_user_app error: {e}")
+        return []
+
+def release_user_app_numbers(user_id, app_name):
+    """Release (delete ownership of) all numbers the user holds for a given app."""
+    try:
+        with _db_lock:
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM number_app_assignments WHERE user_id=? AND app_name=?", (user_id, app_name))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"release_user_app_numbers error: {e}")
+
 def assign_number_to_user(user_id, number):
+    """Assign a number. FIXED: checks app ownership + appends to comma-list instead of overwriting."""
     with _db_lock:
         conn = _get_conn()
         c = conn.cursor()
-        # Check if number is already taken by another user
-        c.execute("SELECT user_id FROM users WHERE assigned_number=? AND user_id!=?", (number, user_id))
-        existing = c.fetchone()
-        if existing:
-            logger.warning(f"Number {number} already taken by user {existing[0]}, rejecting assignment to {user_id}")
-            conn.close()
-            return False
-        c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (number, user_id))
+        # NEW: ownership table is authoritative for "taken" checks
+        try:
+            c.execute("SELECT user_id FROM number_app_assignments WHERE number=?", (str(number),))
+            owner = c.fetchone()
+            if owner and owner[0] != user_id:
+                logger.warning(f"Number {number} already owned by user {owner[0]}, rejecting assignment to {user_id}")
+                conn.close()
+                return False
+        except Exception:
+            owner = None
+        # Legacy check: exact or comma-list membership held by another user
+        c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != '' AND user_id!=?", (user_id,))
+        for other_uid, alist in c.fetchall():
+            nums = [n.strip() for n in str(alist).split(',') if n.strip()]
+            if str(number) in nums:
+                logger.warning(f"Number {number} already taken by user {other_uid}, rejecting assignment to {user_id}")
+                conn.close()
+                return False
+        # Append to this user's comma-list (avoid duplicates)
+        c.execute("SELECT assigned_number FROM users WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        current = [n.strip() for n in str(row[0]).split(',') if n.strip()] if row and row[0] else []
+        if str(number) not in current:
+            current.append(str(number))
+        c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (",".join(current), user_id))
         conn.commit()
         conn.close()
         log_user_activity(user_id, "number_assigned", f"Number {number} assigned")
@@ -1131,6 +1236,18 @@ def release_number(number):
     with _db_lock:
         conn = _get_conn()
         c = conn.cursor()
+        # Remove app ownership (NEW)
+        try:
+            c.execute("DELETE FROM number_app_assignments WHERE number=?", (str(number),))
+        except Exception:
+            pass
+        # Remove from user assignment (handles comma-lists too)
+        c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
+        for uid, alist in c.fetchall():
+            nums = [n.strip() for n in str(alist).split(',') if n.strip()]
+            if str(number) in nums:
+                nums.remove(str(number))
+                c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (",".join(nums) if nums else None, uid))
         # Remove from user assignment
         c.execute("UPDATE users SET assigned_number=NULL WHERE assigned_number=?", (number,))
         # Delete from combo stock entirely
@@ -1161,27 +1278,46 @@ def release_number(number):
         conn.close()
         _persist_db()
 
-def get_combo(country_code, combo_index=1, user_id=None):
+def get_combo(country_code, combo_index=1, user_id=None, app_name=None):
+    """Get combo numbers. FIXED: filter by app_name when provided (app isolation)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    if user_id:
-        c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=?", (user_id, country_code))
-        row = c.fetchone()
-        if row:
-            conn.close()
-            return json.loads(row[0])
-    c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=?", (country_code, combo_index))
-    row = c.fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else []
+    try:
+        if user_id:
+            if app_name:
+                c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=? AND app_name=?", (user_id, country_code, app_name))
+            else:
+                c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=?", (user_id, country_code))
+            row = c.fetchone()
+            if row:
+                return json.loads(row[0]) if row[0] else []
+        if app_name:
+            # FIXED: only return numbers whose combo matches the requested app
+            c.execute("SELECT numbers FROM combos WHERE country_code=? AND app_name=? AND combo_index=?", (country_code, app_name, combo_index))
+            row = c.fetchone()
+            if not row or not row[0]:
+                # Fall back to the first combo of this app for the country
+                c.execute("SELECT numbers FROM combos WHERE country_code=? AND app_name=? ORDER BY combo_index LIMIT 1", (country_code, app_name))
+                row = c.fetchone()
+            return json.loads(row[0]) if row and row[0] else []
+        else:
+            c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=?", (country_code, combo_index))
+            row = c.fetchone()
+            return json.loads(row[0]) if row and row[0] else []
+    except json.JSONDecodeError as je:
+        logger.error(f"get_combo: bad JSON for {country_code} combo {combo_index} app={app_name}: {je}")
+        return []
+    finally:
+        conn.close()
 
 def save_combo(country_code, numbers, user_id=None, app_name="WhatsApp", broadcast=False, price_per_otp=None):
     """Save combo. If broadcast=True and user_id is None, notify all users & groups."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if user_id:
-        c.execute("REPLACE INTO private_combos (user_id, country_code, numbers) VALUES (?, ?, ?)",
-                  (user_id, country_code, json.dumps(numbers)))
+        # FIXED: store app_name so private combos stay app-isolated
+        c.execute("REPLACE INTO private_combos (user_id, country_code, app_name, numbers) VALUES (?, ?, ?, ?)",
+                  (user_id, country_code, app_name or "WhatsApp", json.dumps(numbers)))
         conn.commit()
         conn.close()
         return
@@ -1218,8 +1354,9 @@ def delete_combo(country_code, combo_index=None):
     conn.commit()
     conn.close()
 
-def get_available_numbers(country_code, combo_index=1, user_id=None):
-    all_numbers = get_combo(country_code, combo_index, user_id)
+def get_available_numbers(country_code, combo_index=1, user_id=None, app_name=None):
+    """FIXED: pass app_name through to get_combo so numbers stay app-isolated."""
+    all_numbers = get_combo(country_code, combo_index, user_id, app_name=app_name)
     if not all_numbers:
         return []
     conn = sqlite3.connect(DB_PATH)
@@ -4375,6 +4512,7 @@ def _dispatch_callback(call, data, chat_id, msg_id, user_id):
             bot.answer_callback_query(call.id, "CC ON — prefix removed", show_alert=False)
         else:
             bot.answer_callback_query(call.id, "CC OFF — prefix restored", show_alert=False)
+        # FIXED: refresh the card (numbers now pulled from app-filtered session)
         _show_number_display(chat_id, msg_id, number, country_key, app)
         return
 
@@ -4400,14 +4538,20 @@ def _dispatch_callback(call, data, chat_id, msg_id, user_id):
             bot.answer_callback_query(call.id, f"✅ OTP: {otp}", show_alert=True)
 
 def show_user_countries(chat_id, app_name, message_id):
+    # FIXED (app filtering): only show countries that have stock for THIS app
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT country_code, combo_index, numbers FROM combos")
+    c.execute("SELECT country_code, combo_index, numbers, app_name FROM combos WHERE app_name=?", (app_name,))
     combos = c.fetchall()
     conn.close()
     countries = {}
-    for cc, ci, nums_json in combos:
-        nums = json.loads(nums_json)
+    for cc, ci, nums_json, combo_app in combos:
+        if combo_app and app_name and combo_app != app_name:
+            continue  # never mix numbers across apps
+        try:
+            nums = json.loads(nums_json)
+        except Exception:
+            continue
         if nums:
             iso = COUNTRY_CODES.get(cc, (cc, "UN"))[1]
             name = COUNTRY_CODES.get(cc, (cc, "UN"))[0]
@@ -4436,29 +4580,27 @@ def _strip_cc(number, country_key):
     return str(number)
 
 def _show_number_display(chat_id, message_id, number, country_key, app_name, extra_numbers=None):
-    """Display the assigned number(s) in the AK NUMBER BOT card format (NEW)."""
+    """Display the assigned number(s) - EXACT layout from the reference image."""
     country_name = COUNTRY_CODES.get(country_key, (country_key, "Unknown"))[0].upper()
     iso = COUNTRY_CODES.get(country_key, (country_key, "UN"))[1]
-    flag = flag_emoji_html(iso)
-    svc = app_emoji_html(app_name)
 
-    # Build the number list (all assigned numbers, one per line)
-    if extra_numbers:
-        # extra_numbers already contains bullet lines; rebuild as plain code lines
-        all_nums = [number]
+    # Numbers currently held by this user for THIS app (app-filtered)
+    held = get_numbers_for_user_app(chat_id, app_name)
+    if not held:
+        # Legacy fallback: comma-separated assigned_number field
         try:
             u = get_user(chat_id)
             if u and len(u) > 5 and u[5]:
-                all_nums = [n.strip() for n in u[5].split(",") if n.strip()]
+                held = [n.strip() for n in str(u[5]).split(',') if n.strip()]
         except Exception:
-            pass
-    else:
-        all_nums = [number]
+            held = []
+    if number and number not in held:
+        held.insert(0, number)
 
     remove_cc = get_remove_cc(chat_id)
     lines = []
-    for n in all_nums:
-        disp = _strip_cc(n, country_key) if remove_cc else f"+{n}"
+    for n in held:
+        disp = _strip_cc(n, country_key) if remove_cc else str(n)
         lines.append(f"<code>{disp}</code>")
     nums_block = "\n".join(lines)
 
@@ -4466,34 +4608,34 @@ def _show_number_display(chat_id, message_id, number, country_key, app_name, ext
     otp_link = get_setting('main_otp_link') or "https://t.me/THELIGHTSMS000"
 
     msg_text = (
-        f"{flag} <b>Country:</b> {country_name} ({iso})\n"
-        f"\u23f3 <b>Waiting for OTP</b>\n"
-        f"{svc} <b>{app_name}</b>\n"
-        f"\U0001f310 Website Link\n"
+        f"🌍 <b>Country:</b> {country_name} ({iso})\n\n"
+        f"⏳ <b>Waiting for OTP</b>\n\n"
+        f"<b>{app_name}</b>\n"
+        f"Website Link\n"
         f"{nums_block}"
     )
 
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        ibtn("\U0001f504 Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
-        ibtn("OTP Group", url=otp_link, style="primary", icon="announcement"),
+        ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger"),
+        ibtn("OTP Group", url=otp_link, style="primary"),
     )
     markup.row(
-        ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
-        ibtn("Back", callback_data="close_menu", style="primary", icon="back"),
+        ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success"),
+        ibtn("Back", callback_data="close_menu", style="danger"),
     )
     bot.edit_message_text(msg_text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
 
 def fetch_number_logic(chat_id, app_name, country_key, message_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=1", (country_key,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        bot.edit_message_text("\u274c No numbers for this country.", chat_id, message_id, parse_mode="HTML")
+    """FIXED (app filtering): only pull numbers from combos whose app matches the request."""
+    # Grab available numbers for THIS app only
+    numbers = get_combo(country_key, 1, user_id=None, app_name=app_name)
+    if not numbers:
+        # Fallback: private combo for this app
+        numbers = get_combo(country_key, 1, user_id=chat_id, app_name=app_name)
+    if not numbers:
+        bot.edit_message_text("\u274c No numbers available for this app/country.", chat_id, message_id, parse_mode="HTML")
         return
-    numbers = json.loads(row[0])
     used = []
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -4505,41 +4647,42 @@ def fetch_number_logic(chat_id, app_name, country_key, message_id):
         bot.edit_message_text("\u274c All numbers currently in use.", chat_id, message_id, parse_mode="HTML")
         return
 
-    # Fixed: Get num_per_request setting and give user that many numbers
+    # Get num_per_request setting and give user that many numbers
     num_per_req = 1
     try:
         npr_setting = get_setting('num_per_request')
         if npr_setting:
             num_per_req = int(npr_setting)
-    except:
+    except Exception:
         num_per_req = 1
     num_per_req = max(1, min(num_per_req, len(available)))  # Clamp to available
 
-    # Release old number before assigning new ones
+    # Release previously held numbers for THIS app before assigning new ones
+    old_nums = get_numbers_for_user_app(chat_id, app_name)
+    for old in old_nums:
+        release_number(old)
+    release_user_app_numbers(chat_id, app_name)
+    # Legacy comma-list: drop numbers just released, keep numbers for other apps
     old_user = get_user(chat_id)
+    legacy = []
     if old_user and len(old_user) > 5 and old_user[5]:
-        release_number(old_user[5])
+        legacy = [n.strip() for n in str(old_user[5]).split(',') if n.strip()]
+    legacy = [n for n in legacy if n not in old_nums]
 
     # Assign num_per_req numbers
     assigned_numbers = random.sample(available, min(num_per_req, len(available)))
-    assigned = assigned_numbers[0]  # Primary number for display
 
-    # Save all assigned numbers (store as comma-separated in assigned_number)
-    if len(assigned_numbers) > 1:
-        save_user(chat_id, country_code=country_key, assigned_number=",".join(assigned_numbers))
-        for num in assigned_numbers:
-            assign_number_to_user(chat_id, num)
-    else:
-        assign_number_to_user(chat_id, assigned)
-        save_user(chat_id, country_code=country_key, assigned_number=assigned)
+    # Persist assignments: users.assigned_number (legacy compat) + app ownership
+    merged = legacy + assigned_numbers
+    save_user(chat_id, country_code=country_key, assigned_number=",".join(merged))
+    for num in assigned_numbers:
+        if assign_number_to_user(chat_id, num):
+            set_number_app(num, chat_id, app_name, country_key)
 
-    # Show all assigned numbers
-    if len(assigned_numbers) > 1:
-        nums_text = "\n".join([f"\u2022 <code>{n}</code>" for n in assigned_numbers])
-        _show_number_display(chat_id, message_id, assigned, country_key, app_name, extra_numbers=nums_text)
-    else:
-        _show_number_display(chat_id, message_id, assigned, country_key, app_name)
+    # Show the number card (exact layout from the reference image)
+    _show_number_display(chat_id, message_id, assigned_numbers[0], country_key, app_name)
 
+# ---- 2FA and withdrawal step handlers ----
 # ---- 2FA and withdrawal step handlers ----
 def process_2fa_code(message):
     st = user_states.get(message.chat.id, {})
@@ -6150,6 +6293,11 @@ def combo_custom_app_handler(message):
 
 def admin_reject_reason_step(message):
     st = user_states.get(message.chat.id, {})
+    # FIXED: req_id was undefined here - read it from the stored state
+    req_id = st.get("reject_reason") if isinstance(st, dict) else None
+    if not req_id:
+        bot.send_message(message.chat.id, "❌ No pending rejection. Try again.", parse_mode="HTML")
+        return
     reason = message.text if message.text.lower() != '/skip' else "Rejected by admin"
     success, result = reject_withdrawal(req_id, message.chat.id, reason)
     if success:
