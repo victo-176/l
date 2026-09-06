@@ -782,9 +782,14 @@ def notify_admins_new_withdrawal(user_id, amount, method, account_no, full_name=
         f"<b>Method:</b> {_html.escape(str(method).upper())}\n"
         f"<b>Account No:</b> <code>{_html.escape(str(account_no or 'N/A'))}</code>"
     )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        ibtn("Approve", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"),
+        ibtn("Decline", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"),
+    )
     for admin in get_all_admins():
         try:
-            bot.send_message(admin, msg, parse_mode="HTML")
+            bot.send_message(admin, msg, parse_mode="HTML", reply_markup=markup)
         except Exception as e:
             logger.error(f"[WithdrawNotify] Failed to notify admin {admin}: {e}")
 
