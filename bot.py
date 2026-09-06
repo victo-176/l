@@ -4903,6 +4903,7 @@ def get_admin_menu():
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
         ibtn("💾 Backup", callback_data="admin_backup", style="success", icon="archive"),
         ibtn("👤 View Member", callback_data="admin_view_member", style="primary", icon="profile"),
+        ibtn("📩 Message User", callback_data="admin_msg_user", style="primary", icon="chat"),
         ibtn("Leave", callback_data="close_menu", style="danger", icon="back")
     ]
     for i in range(0, len(buttons), 2):
@@ -5513,6 +5514,14 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
         bot.edit_message_text("Send new watermark text:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: Admin Message User - two-step flow (user ID, then message)
+    if data == "admin_msg_user":
+        set_state(chat_id, "admin_msg_user_id")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text("\U0001f4e9 <b>MESSAGE USER</b>\n\n\U0001f464 Enter the User ID to message:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
 
     # NEW: View Member - full member details with add/deduct balance buttons
@@ -6701,6 +6710,103 @@ def vm_deduct_balance_handler(message):
             pass
     except ValueError:
         bot.reply_to(message, "\u274c Invalid amount.", parse_mode="HTML")
+
+# ======================== ADMIN MESSAGE USER (NEW) ========================
+def _admin_send_message(admin_id, target_uid, msg_text):
+    """Core admin-to-user message sender. Returns (ok, error_text)."""
+    try:
+        user = get_user(target_uid)
+        if not user:
+            return False, f"\u274c User <code>{target_uid}</code> not found in the users table."
+        if not msg_text or not msg_text.strip():
+            return False, "\u274c Message cannot be empty."
+        # Escape HTML so user-typed < > & don't break parse_mode
+        safe = html_mod.escape(msg_text.strip())
+        text = (
+            f"\U0001f4e9 <b>Admin Message</b>\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"{safe}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"<i>This is an official message from the bot admin.</i>"
+        )
+        try:
+            bot.send_message(target_uid, text, parse_mode="HTML")
+        except telebot.apihelper.ApiTelegramException as te:
+            code = getattr(te, "error_code", 0)
+            if code == 403:
+                return False, f"\u274c User <code>{target_uid}</code> has blocked the bot."
+            if code == 400:
+                return False, f"\u274c Chat not found for user <code>{target_uid}</code>."
+            return False, f"\u274c Telegram error {code}: {te}"
+        # Log to admin_logs (action: admin_msg, details: user_id + preview)
+        try:
+            with _db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("INSERT INTO admin_logs (admin_id, action, details) VALUES (?, ?, ?)",
+                          (admin_id, "admin_msg", f"user_id={target_uid} | msg={msg_text.strip()[:100]}"))
+                conn.commit()
+                conn.close()
+        except Exception as log_err:
+            logger.error(f"admin_msg log failed: {log_err}")
+        return True, None
+    except Exception as e:
+        logger.error(f"_admin_send_message error: {e}")
+        return False, f"\u274c Error: {e}"
+
+@bot.message_handler(commands=['msg'])
+def admin_msg_command(message):
+    """/msg <user_id> <message> - admin-only direct message."""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "\u26a0\ufe0f Admin only.", parse_mode="HTML")
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "\u26a0\ufe0f Usage: <code>/msg &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        target_uid = int(parts[1].strip())
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid user ID. Usage: <code>/msg &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    ok, err = _admin_send_message(message.from_user.id, target_uid, parts[2])
+    if ok:
+        bot.reply_to(message, f"\u2705 Message sent to <code>{target_uid}</code>.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, err, parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "admin_msg_user_id" and is_admin(msg.from_user.id))
+def admin_msg_user_id_handler(message):
+    raw = message.text.strip()
+    if raw.lstrip("@").isdigit():
+        try:
+            uid = int(raw)
+        except ValueError:
+            uid = None
+    else:
+        uid = None
+    if uid is None:
+        bot.reply_to(message, "\u274c Invalid ID. Send a numeric User ID (or /cancel):", parse_mode="HTML")
+        return
+    if not get_user(uid):
+        bot.reply_to(message, f"\u274c User <code>{uid}</code> not found. Send a valid User ID (or /cancel):", parse_mode="HTML")
+        return
+    set_state(message.chat.id, {"state": "admin_msg_text", "target_user": uid})
+    bot.reply_to(message, f"\u270d\ufe0f Send the message to send to user <code>{uid}</code> (or /cancel):", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("state") == "admin_msg_text" and is_admin(msg.from_user.id))
+def admin_msg_text_handler(message):
+    st = get_state(message)
+    uid = st.get("target_user")
+    clear_state(message)
+    if not message.text or not message.text.strip():
+        bot.reply_to(message, "\u274c Message cannot be empty.", parse_mode="HTML")
+        return
+    ok, err = _admin_send_message(message.from_user.id, uid, message.text)
+    if ok:
+        bot.reply_to(message, f"\u2705 Message sent to <code>{uid}</code>.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, err, parse_mode="HTML")
 
 # ======================== SET MIN/MAX WITHDRAW HANDLERS (NEW) ========================
 @bot.message_handler(func=lambda msg: get_state(msg) == "set_min_withdraw" and is_admin(msg.from_user.id))
