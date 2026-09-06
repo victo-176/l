@@ -385,7 +385,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS private_combos (
             user_id INTEGER, country_code TEXT, numbers TEXT,
-            PRIMARY KEY (user_id, country_code)
+            app_name TEXT DEFAULT 'WhatsApp',
+            PRIMARY KEY (user_id, country_code, app_name)
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS force_sub_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -525,6 +526,10 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('num_per_request', '1')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('otp_price', '0.005')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('maintenance', '0')")
+        # NEW: Global withdrawal limits (REAL, stored as strings in bot_settings)
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('min_withdraw', '1.0')")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('max_withdraw', '5.0')")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('main_otp_link', 'https://t.me/THELIGHTSMS000')")
         # Ensure no duplicate numbers across users (migration for existing DBs)
         try:
             c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
@@ -561,13 +566,41 @@ def init_db():
         if "remove_cc" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN remove_cc INTEGER DEFAULT 0")
 
+        # FIXED (app filtering): add app_name to private_combos for existing DBs
+        pc_cols = [r[1] for r in c.execute("PRAGMA table_info(private_combos)")]
+        if "app_name" not in pc_cols:
+            c.execute("ALTER TABLE private_combos ADD COLUMN app_name TEXT DEFAULT 'WhatsApp'")
+            logger.info("Migrated private_combos: added app_name column")
+
+        # NEW (app filtering): app ownership table for assigned numbers
+        c.execute("""CREATE TABLE IF NOT EXISTS number_app_assignments (
+            number TEXT PRIMARY KEY,
+            user_id INTEGER,
+            app_name TEXT,
+            country_code TEXT,
+            assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        # Migration: rebuild ownership rows from users.assigned_number on startup
+        try:
+            c.execute("SELECT user_id, assigned_number, country_code FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
+            for uid, anum, cc in c.fetchall():
+                for n in str(anum).split(','):
+                    n = n.strip()
+                    if not n:
+                        continue
+                    app = get_app_for_number(n) or "WhatsApp"
+                    c.execute("INSERT OR REPLACE INTO number_app_assignments (number, user_id, app_name, country_code) VALUES (?, ?, ?, ?)",
+                              (n, uid, app, cc or ''))
+        except Exception as mig_err:
+            logger.warning(f"number_app_assignments migration warning: {mig_err}")
+
         # === Startup health check: verify all tables exist ===
         required_tables = [
             'users', 'combos', 'otp_logs', 'referrals', 'withdrawals',
             'admins', 'methods', 'bot_settings', 'private_combos',
             'force_sub_channels', 'user_activity', 'response_times',
             'balances', 'leaderboard', 'traffic_log', 'withdrawal_requests',
-            'otp_counts', 'seen_otps', 'sms_panels',
+            'otp_counts', 'seen_otps', 'sms_panels', 'number_app_assignments',
             'broadcasts', 'admin_logs', 'group_settings',
             'number_history', 'blacklist', 'bulk_operations'
         ]
@@ -602,6 +635,138 @@ def init_db():
         logger.info("Database initialized")
 
 init_db()
+
+# ======================== BACKUP / RESTORE (NEW) ========================
+BACKUP_FILE = os.path.join(PERSISTENT_DIR, "backup_light_premium.json")
+
+# All tables included in the one-click backup
+BACKUP_TABLES = [
+    'users', 'combos', 'otp_logs', 'referrals', 'withdrawals',
+    'admins', 'methods', 'bot_settings', 'private_combos',
+    'force_sub_channels', 'user_activity', 'response_times',
+    'balances', 'leaderboard', 'traffic_log', 'withdrawal_requests',
+    'otp_counts', 'seen_otps', 'sms_panels', 'number_app_assignments',
+    'broadcasts', 'admin_logs', 'group_settings',
+    'number_history', 'blacklist', 'bulk_operations'
+]
+
+def backup_all_tables():
+    """Dump all SQLite tables into a single JSON file inside PERSISTENT_DIR.
+    Returns (path, row_counts_dict) or raises on failure."""
+    data = {}
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        for table in BACKUP_TABLES:
+            try:
+                rows = c.execute(f"SELECT * FROM {table}").fetchall()
+                data[table] = [dict(r) for r in rows]
+            except Exception as e:
+                logger.warning(f"Backup: could not read table {table}: {e}")
+                data[table] = []
+        conn.close()
+    tmp = BACKUP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, default=str)
+    os.replace(tmp, BACKUP_FILE)
+    return BACKUP_FILE, {t: len(v) for t, v in data.items()}
+
+def restore_from_backup():
+    """Restore all tables from backup JSON. Clears each table first.
+    Returns (True, summary_str) on success, (False, error_str) on failure."""
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("Backup file has invalid structure")
+    except Exception as e:
+        return False, f"Backup file unreadable/corrupted: {e}"
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        try:
+            restored = {}
+            for table in BACKUP_TABLES:
+                rows = data.get(table)
+                if rows is None:
+                    continue
+                c.execute(f"DELETE FROM {table}")
+                count = 0
+                for row in rows:
+                    if not isinstance(row, dict) or not row:
+                        continue
+                    cols = list(row.keys())
+                    ph = ", ".join("?" for _ in cols)
+                    try:
+                        c.execute(f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({ph})",
+                                  tuple(row[k] for k in cols))
+                        count += 1
+                    except Exception as row_err:
+                        logger.warning(f"Restore: skipped row in {table}: {row_err}")
+                restored[table] = count
+            conn.commit()
+            summary = ", ".join(f"{t}:{n}" for t, n in restored.items())
+            return True, summary
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+def auto_restore_if_empty():
+    """On startup: if the users table is empty and a backup file exists, restore it."""
+    try:
+        if not os.path.exists(BACKUP_FILE):
+            return
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        empty = (c.fetchone()[0] or 0) == 0
+        conn.close()
+        if not empty:
+            logger.info("Backup restore skipped: DB already has data")
+            return
+        logger.info("DB is empty and backup file found — restoring...")
+        ok, info = restore_from_backup()
+        if ok:
+            logger.info(f"Auto-restore complete: {info}")
+            try:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"💾 <b>Auto-Restore Complete</b>\n\nDatabase was empty — restored from backup.\n<code>{info}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            logger.error(f"Auto-restore FAILED: {info}")
+            try:
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"🚨 <b>Auto-Restore Failed!</b>\n\n<code>{info}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"auto_restore_if_empty error: {e}")
+
+def get_withdraw_limits():
+    """Load min/max withdrawal from DB settings (defaults 1.0 / 5.0)."""
+    try:
+        mn = float(get_setting('min_withdraw') or 1.0)
+    except (TypeError, ValueError):
+        mn = 1.0
+    try:
+        mx = float(get_setting('max_withdraw') or 5.0)
+    except (TypeError, ValueError):
+        mx = 5.0
+    if mn <= 0:
+        mn = 1.0
+    if mx < mn:
+        mx = mn
+    return mn, mx
 
 # =========================== SEEN OTP HELPERS (DB-backed deduplication) ===========================
 
@@ -902,26 +1067,42 @@ def get_user_by_number(number):
         conn.close()
         return row[0]
     # Try fuzzy: get all assigned numbers and check if any is a suffix/prefix match
+    # FIXED: comma-lists (multi-number users) are split and checked per number
     c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
-    for uid, anum in c.fetchall():
-        clean_anum = re.sub(r'\D', '', str(anum))
-        if not clean_anum:
-            continue
-        # Check if one contains the other (for country code differences)
-        if clean.endswith(clean_anum) or clean_anum.endswith(clean):
-            conn.close()
-            return uid
-        if clean.startswith(clean_anum) or clean_anum.startswith(clean):
-            # Only match if the remaining part is at least 5 digits
-            diff = abs(len(clean) - len(clean_anum))
-            if diff >= 0 and min(len(clean), len(clean_anum)) >= 5:
+    for uid, anum_raw in c.fetchall():
+        for anum in str(anum_raw).split(','):
+            clean_anum = re.sub(r'\D', '', str(anum))
+            if not clean_anum:
+                continue
+            if clean == clean_anum:
                 conn.close()
                 return uid
+            # Check if one contains the other (for country code differences)
+            if clean.endswith(clean_anum) or clean_anum.endswith(clean):
+                conn.close()
+                return uid
+            if clean.startswith(clean_anum) or clean_anum.startswith(clean):
+                # Only match if the remaining part is at least 5 digits
+                diff = abs(len(clean) - len(clean_anum))
+                if diff >= 0 and min(len(clean), len(clean_anum)) >= 5:
+                    conn.close()
+                    return uid
     conn.close()
     return None
 
 def get_app_for_number(number):
-    """Look up which app a phone number is assigned to from combos."""
+    """Look up which app a phone number is assigned to (ownership table first, then combos)."""
+    try:
+        # NEW: check explicit ownership first (assigned numbers always know their app)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT app_name FROM number_app_assignments WHERE number=?", (str(number),))
+        r = c.fetchone()
+        conn.close()
+        if r and r[0]:
+            return r[0]
+    except Exception as e:
+        logger.debug(f"get_app_for_number ownership lookup error: {e}")
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -970,18 +1151,78 @@ def get_price_for_number(number):
         logger.debug(f"get_price_for_number error: {e}")
     return None
 
+# ======================== NUMBER APP OWNERSHIP (NEW - app filtering fix) ========================
+def set_number_app(number, user_id, app_name, country_code=""):
+    """Record which app a user's assigned number belongs to."""
+    if not number:
+        return
+    try:
+        with _db_lock:
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO number_app_assignments (number, user_id, app_name, country_code, assigned_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                      (str(number), user_id, app_name or "WhatsApp", country_code or ""))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"set_number_app error for {number}: {e}")
+
+def get_numbers_for_user_app(user_id, app_name):
+    """All numbers currently assigned to user for the given app."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT number FROM number_app_assignments WHERE user_id=? AND app_name=? ORDER BY assigned_at",
+                  (user_id, app_name))
+        nums = [r[0] for r in c.fetchall()]
+        conn.close()
+        return nums
+    except Exception as e:
+        logger.error(f"get_numbers_for_user_app error: {e}")
+        return []
+
+def release_user_app_numbers(user_id, app_name):
+    """Release (delete ownership of) all numbers the user holds for a given app."""
+    try:
+        with _db_lock:
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM number_app_assignments WHERE user_id=? AND app_name=?", (user_id, app_name))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"release_user_app_numbers error: {e}")
+
 def assign_number_to_user(user_id, number):
+    """Assign a number. FIXED: checks app ownership + appends to comma-list instead of overwriting."""
     with _db_lock:
         conn = _get_conn()
         c = conn.cursor()
-        # Check if number is already taken by another user
-        c.execute("SELECT user_id FROM users WHERE assigned_number=? AND user_id!=?", (number, user_id))
-        existing = c.fetchone()
-        if existing:
-            logger.warning(f"Number {number} already taken by user {existing[0]}, rejecting assignment to {user_id}")
-            conn.close()
-            return False
-        c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (number, user_id))
+        # NEW: ownership table is authoritative for "taken" checks
+        try:
+            c.execute("SELECT user_id FROM number_app_assignments WHERE number=?", (str(number),))
+            owner = c.fetchone()
+            if owner and owner[0] != user_id:
+                logger.warning(f"Number {number} already owned by user {owner[0]}, rejecting assignment to {user_id}")
+                conn.close()
+                return False
+        except Exception:
+            owner = None
+        # Legacy check: exact or comma-list membership held by another user
+        c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != '' AND user_id!=?", (user_id,))
+        for other_uid, alist in c.fetchall():
+            nums = [n.strip() for n in str(alist).split(',') if n.strip()]
+            if str(number) in nums:
+                logger.warning(f"Number {number} already taken by user {other_uid}, rejecting assignment to {user_id}")
+                conn.close()
+                return False
+        # Append to this user's comma-list (avoid duplicates)
+        c.execute("SELECT assigned_number FROM users WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        current = [n.strip() for n in str(row[0]).split(',') if n.strip()] if row and row[0] else []
+        if str(number) not in current:
+            current.append(str(number))
+        c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (",".join(current), user_id))
         conn.commit()
         conn.close()
         log_user_activity(user_id, "number_assigned", f"Number {number} assigned")
@@ -995,6 +1236,18 @@ def release_number(number):
     with _db_lock:
         conn = _get_conn()
         c = conn.cursor()
+        # Remove app ownership (NEW)
+        try:
+            c.execute("DELETE FROM number_app_assignments WHERE number=?", (str(number),))
+        except Exception:
+            pass
+        # Remove from user assignment (handles comma-lists too)
+        c.execute("SELECT user_id, assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
+        for uid, alist in c.fetchall():
+            nums = [n.strip() for n in str(alist).split(',') if n.strip()]
+            if str(number) in nums:
+                nums.remove(str(number))
+                c.execute("UPDATE users SET assigned_number=? WHERE user_id=?", (",".join(nums) if nums else None, uid))
         # Remove from user assignment
         c.execute("UPDATE users SET assigned_number=NULL WHERE assigned_number=?", (number,))
         # Delete from combo stock entirely
@@ -1025,27 +1278,46 @@ def release_number(number):
         conn.close()
         _persist_db()
 
-def get_combo(country_code, combo_index=1, user_id=None):
+def get_combo(country_code, combo_index=1, user_id=None, app_name=None):
+    """Get combo numbers. FIXED: filter by app_name when provided (app isolation)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    if user_id:
-        c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=?", (user_id, country_code))
-        row = c.fetchone()
-        if row:
-            conn.close()
-            return json.loads(row[0])
-    c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=?", (country_code, combo_index))
-    row = c.fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else []
+    try:
+        if user_id:
+            if app_name:
+                c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=? AND app_name=?", (user_id, country_code, app_name))
+            else:
+                c.execute("SELECT numbers FROM private_combos WHERE user_id=? AND country_code=?", (user_id, country_code))
+            row = c.fetchone()
+            if row:
+                return json.loads(row[0]) if row[0] else []
+        if app_name:
+            # FIXED: only return numbers whose combo matches the requested app
+            c.execute("SELECT numbers FROM combos WHERE country_code=? AND app_name=? AND combo_index=?", (country_code, app_name, combo_index))
+            row = c.fetchone()
+            if not row or not row[0]:
+                # Fall back to the first combo of this app for the country
+                c.execute("SELECT numbers FROM combos WHERE country_code=? AND app_name=? ORDER BY combo_index LIMIT 1", (country_code, app_name))
+                row = c.fetchone()
+            return json.loads(row[0]) if row and row[0] else []
+        else:
+            c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=?", (country_code, combo_index))
+            row = c.fetchone()
+            return json.loads(row[0]) if row and row[0] else []
+    except json.JSONDecodeError as je:
+        logger.error(f"get_combo: bad JSON for {country_code} combo {combo_index} app={app_name}: {je}")
+        return []
+    finally:
+        conn.close()
 
 def save_combo(country_code, numbers, user_id=None, app_name="WhatsApp", broadcast=False, price_per_otp=None):
     """Save combo. If broadcast=True and user_id is None, notify all users & groups."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if user_id:
-        c.execute("REPLACE INTO private_combos (user_id, country_code, numbers) VALUES (?, ?, ?)",
-                  (user_id, country_code, json.dumps(numbers)))
+        # FIXED: store app_name so private combos stay app-isolated
+        c.execute("REPLACE INTO private_combos (user_id, country_code, app_name, numbers) VALUES (?, ?, ?, ?)",
+                  (user_id, country_code, app_name or "WhatsApp", json.dumps(numbers)))
         conn.commit()
         conn.close()
         return
@@ -1082,8 +1354,9 @@ def delete_combo(country_code, combo_index=None):
     conn.commit()
     conn.close()
 
-def get_available_numbers(country_code, combo_index=1, user_id=None):
-    all_numbers = get_combo(country_code, combo_index, user_id)
+def get_available_numbers(country_code, combo_index=1, user_id=None, app_name=None):
+    """FIXED: pass app_name through to get_combo so numbers stay app-isolated."""
+    all_numbers = get_combo(country_code, combo_index, user_id, app_name=app_name)
     if not all_numbers:
         return []
     conn = sqlite3.connect(DB_PATH)
@@ -1946,28 +2219,30 @@ def send_otp_to_user_and_group(date_str, number, sms, app_name=None):
         logger.debug(f"Real-time OTP to admin failed: {rt_err}")
 
 def format_message(date_str, number, sms, flag_html, app_emoji):
-    masked = mask_number(number)
+    """Group OTP message in THE LIGHT format (NEW layout)."""
     otp = extract_otp(sms)
-    service_name = detect_service(sms).upper()
-    msg_text = sms[:200] if sms else ""
-    # Strip disclaimer text from SMS - be aggressive, remove any occurrence
-    msg_text = re.sub(r"(?i)Don'?t\s+share\s+this\s+code\s+with\s+others\.?", '', msg_text).strip()
+    country_name, iso, _ = get_country_info(number)
+    # service passed via detect_service; lowercase per screenshot
+    service_name = detect_service(sms).lower() if sms else "unknown"
+    # Full (unmasked) number per screenshot
+    phone = str(number)
+    flag_unicode = flag_emoji_html(iso)  # premium/unicode flag
+
+    # Cleaned SMS text (strip common disclaimers), first 300 chars
+    msg_text = sms[:300] if sms else ""
+    msg_text = re.sub(r"(?i)Don'?t\s+share\s+(this|your)\s+(confirmation\s+)?code\s+with\s+(others|anyone)\.?", '', msg_text).strip()
     msg_text = re.sub(r"(?i)please\s+do\s+not\s+disclose\s+it\s+to\s+anyone\.?", '', msg_text).strip()
     msg_text = re.sub(r"(?i)disclose\s+it\s+to\s+anyone\.?", '', msg_text).strip()
-    msg_text = re.sub(r"\s+", ' ', msg_text).strip()  # collapse multiple spaces
-    # Format OTP with hyphen if 6 digits
-    otp_display = otp
-    if len(otp) == 6:
-        otp_display = f"{otp[:3]}-{otp[3:]}"
+    msg_text = re.sub(r"\s+", ' ', msg_text).strip()
+
     return (
-        f"<b>THE-LIGHT</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"{flag_html} <b>{service_name}</b> 🟢\n"
-        f"📱 <code>{masked}</code>\n"
-        f"🔑 <b>OTP:</b> <code>{otp_display}</code>\n"
-        f"📩 <b>Message:</b> <code>{msg_text[:200]}</code>\n"
-        f"⏰ {date_str}\n"
-        f"━━━━━━━━━━━━━━━"
+        f"<b>{country_name} {service_name} OTP Received!</b> \U0001f970\n\n"
+        f"Time: {date_str}\n"
+        f"Country: {country_name} {flag_unicode}\n"
+        f"Service: {service_name}\n"
+        f"Number: {phone}\n"
+        f"OTP: <b>{otp}</b>\n\n"
+        f"Full Message:\n{msg_text}"
     )
 
 def send_to_telegram_group(text, otp_code, number):
@@ -4154,6 +4429,16 @@ def show_referrals(chat_id):
 
 # ---- Withdrawals ----
 def start_withdrawal(chat_id):
+    # NEW: Block withdrawal entirely if balance is below min_withdraw
+    try:
+        min_w, _max_w = get_withdraw_limits()
+        user = get_user(chat_id)
+        balance = user[10] if user and len(user) > 10 and user[10] is not None else 0.0
+        if balance < min_w:
+            bot.send_message(chat_id, f"\u274c <b>Withdrawal Unavailable</b>\n\nYour balance (${balance:.2f}) is below the minimum withdrawal of ${min_w:.2f}.", parse_mode="HTML")
+            return
+    except Exception as e:
+        logger.warning(f"withdraw min-balance check failed: {e}")
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(ibtn("Opay (10‑digit phone)", callback_data="withdraw_method|opay", style="success", icon="card"))
     markup.add(ibtn("USDT (BEP20 address)", callback_data="withdraw_method|usdt", style="primary", icon="dollar"))
@@ -4291,6 +4576,7 @@ def _dispatch_callback(call, data, chat_id, msg_id, user_id):
             bot.answer_callback_query(call.id, "CC ON — prefix removed", show_alert=False)
         else:
             bot.answer_callback_query(call.id, "CC OFF — prefix restored", show_alert=False)
+        # FIXED: refresh the card (numbers now pulled from app-filtered session)
         _show_number_display(chat_id, msg_id, number, country_key, app)
         return
 
@@ -4316,14 +4602,20 @@ def _dispatch_callback(call, data, chat_id, msg_id, user_id):
             bot.answer_callback_query(call.id, f"✅ OTP: {otp}", show_alert=True)
 
 def show_user_countries(chat_id, app_name, message_id):
+    # FIXED (app filtering): only show countries that have stock for THIS app
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT country_code, combo_index, numbers FROM combos")
+    c.execute("SELECT country_code, combo_index, numbers, app_name FROM combos WHERE app_name=?", (app_name,))
     combos = c.fetchall()
     conn.close()
     countries = {}
-    for cc, ci, nums_json in combos:
-        nums = json.loads(nums_json)
+    for cc, ci, nums_json, combo_app in combos:
+        if combo_app and app_name and combo_app != app_name:
+            continue  # never mix numbers across apps
+        try:
+            nums = json.loads(nums_json)
+        except Exception:
+            continue
         if nums:
             iso = COUNTRY_CODES.get(cc, (cc, "UN"))[1]
             name = COUNTRY_CODES.get(cc, (cc, "UN"))[0]
@@ -4352,49 +4644,62 @@ def _strip_cc(number, country_key):
     return str(number)
 
 def _show_number_display(chat_id, message_id, number, country_key, app_name, extra_numbers=None):
-    """Display the assigned number(s) with CC toggle and other buttons."""
-    country_name = COUNTRY_CODES.get(country_key, (country_key, "Unknown"))[0]
+    """Display the assigned number(s) - EXACT layout from the reference image."""
+    country_name = COUNTRY_CODES.get(country_key, (country_key, "Unknown"))[0].upper()
     iso = COUNTRY_CODES.get(country_key, (country_key, "UN"))[1]
-    flag = flag_emoji_html(iso)
-    svc = app_emoji_html(app_name)
+
+    # Numbers currently held by this user for THIS app (app-filtered)
+    held = get_numbers_for_user_app(chat_id, app_name)
+    if not held:
+        # Legacy fallback: comma-separated assigned_number field
+        try:
+            u = get_user(chat_id)
+            if u and len(u) > 5 and u[5]:
+                held = [n.strip() for n in str(u[5]).split(',') if n.strip()]
+        except Exception:
+            held = []
+    if number and number not in held:
+        held.insert(0, number)
 
     remove_cc = get_remove_cc(chat_id)
-    if remove_cc:
-        display_number = _strip_cc(number, country_key)
-        cc_btn_text = "🌍 CC ON"
-    else:
-        display_number = f"+{number}"
-        cc_btn_text = "🌍 CC"
+    lines = []
+    for n in held:
+        disp = _strip_cc(n, country_key) if remove_cc else str(n)
+        lines.append(f"<code>{disp}</code>")
+    nums_block = "\n".join(lines)
+
+    # OTP group link from settings
+    otp_link = get_setting('main_otp_link') or "https://t.me/THELIGHTSMS000"
 
     msg_text = (
-        f"📞 <b>Number:</b> <code>{display_number}</code>\n"
-        f"{flag} <b>Country:</b> {country_name}\n"
-        f"{svc} <b>Service:</b> {app_name}\n"
-        f"⏳ <b>Status:</b> Waiting for SMS"
+        f"🌍 <b>Country:</b> {country_name} ({iso})\n\n"
+        f"⏳ <b>Waiting for OTP</b>\n\n"
+        f"<b>{app_name}</b>\n"
+        f"Website Link\n"
+        f"{nums_block}"
     )
-    # Fixed: Show extra numbers if num_per_request > 1
-    if extra_numbers:
-        msg_text += f"\n\n📋 <b>All Assigned Numbers:</b>\n{extra_numbers}"
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(ibtn("View OTP", url="https://t.me/THELIGHTSMS000", style="primary", icon="eye"))
     markup.row(
-        ibtn(cc_btn_text, callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success", icon="earth"),
-        ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger", icon="refresh"),
+        ibtn("Change Number", callback_data=f"chg_local|{app_name}|{country_key}", style="danger"),
+        ibtn("OTP Group", url=otp_link, style="primary"),
     )
-    markup.row(ibtn("Back", callback_data="close_menu", style="primary", icon="back"))
+    markup.row(
+        ibtn("ADD CC", callback_data=f"toggle_cc|{app_name}|{country_key}|{number}", style="success"),
+        ibtn("Back", callback_data="close_menu", style="danger"),
+    )
     bot.edit_message_text(msg_text, chat_id, message_id, parse_mode="HTML", reply_markup=markup)
 
 def fetch_number_logic(chat_id, app_name, country_key, message_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT numbers FROM combos WHERE country_code=? AND combo_index=1", (country_key,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        bot.edit_message_text("\u274c No numbers for this country.", chat_id, message_id, parse_mode="HTML")
+    """FIXED (app filtering): only pull numbers from combos whose app matches the request."""
+    # Grab available numbers for THIS app only
+    numbers = get_combo(country_key, 1, user_id=None, app_name=app_name)
+    if not numbers:
+        # Fallback: private combo for this app
+        numbers = get_combo(country_key, 1, user_id=chat_id, app_name=app_name)
+    if not numbers:
+        bot.edit_message_text("\u274c No numbers available for this app/country.", chat_id, message_id, parse_mode="HTML")
         return
-    numbers = json.loads(row[0])
     used = []
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -4406,41 +4711,42 @@ def fetch_number_logic(chat_id, app_name, country_key, message_id):
         bot.edit_message_text("\u274c All numbers currently in use.", chat_id, message_id, parse_mode="HTML")
         return
 
-    # Fixed: Get num_per_request setting and give user that many numbers
+    # Get num_per_request setting and give user that many numbers
     num_per_req = 1
     try:
         npr_setting = get_setting('num_per_request')
         if npr_setting:
             num_per_req = int(npr_setting)
-    except:
+    except Exception:
         num_per_req = 1
     num_per_req = max(1, min(num_per_req, len(available)))  # Clamp to available
 
-    # Release old number before assigning new ones
+    # Release previously held numbers for THIS app before assigning new ones
+    old_nums = get_numbers_for_user_app(chat_id, app_name)
+    for old in old_nums:
+        release_number(old)
+    release_user_app_numbers(chat_id, app_name)
+    # Legacy comma-list: drop numbers just released, keep numbers for other apps
     old_user = get_user(chat_id)
+    legacy = []
     if old_user and len(old_user) > 5 and old_user[5]:
-        release_number(old_user[5])
+        legacy = [n.strip() for n in str(old_user[5]).split(',') if n.strip()]
+    legacy = [n for n in legacy if n not in old_nums]
 
     # Assign num_per_req numbers
     assigned_numbers = random.sample(available, min(num_per_req, len(available)))
-    assigned = assigned_numbers[0]  # Primary number for display
 
-    # Save all assigned numbers (store as comma-separated in assigned_number)
-    if len(assigned_numbers) > 1:
-        save_user(chat_id, country_code=country_key, assigned_number=",".join(assigned_numbers))
-        for num in assigned_numbers:
-            assign_number_to_user(chat_id, num)
-    else:
-        assign_number_to_user(chat_id, assigned)
-        save_user(chat_id, country_code=country_key, assigned_number=assigned)
+    # Persist assignments: users.assigned_number (legacy compat) + app ownership
+    merged = legacy + assigned_numbers
+    save_user(chat_id, country_code=country_key, assigned_number=",".join(merged))
+    for num in assigned_numbers:
+        if assign_number_to_user(chat_id, num):
+            set_number_app(num, chat_id, app_name, country_key)
 
-    # Show all assigned numbers
-    if len(assigned_numbers) > 1:
-        nums_text = "\n".join([f"\u2022 <code>{n}</code>" for n in assigned_numbers])
-        _show_number_display(chat_id, message_id, assigned, country_key, app_name, extra_numbers=nums_text)
-    else:
-        _show_number_display(chat_id, message_id, assigned, country_key, app_name)
+    # Show the number card (exact layout from the reference image)
+    _show_number_display(chat_id, message_id, assigned_numbers[0], country_key, app_name)
 
+# ---- 2FA and withdrawal step handlers ----
 # ---- 2FA and withdrawal step handlers ----
 def process_2fa_code(message):
     st = user_states.get(message.chat.id, {})
@@ -4497,11 +4803,13 @@ def check_withdrawal_amount(user_id, amount):
     user = get_user(user_id)
     balance = user[10] if user and len(user) > 10 else 0.0
     if amount > balance:
-        return f"❌ Insufficient balance. You have ${balance}."
-    if amount < MIN_WITHDRAWAL:
-        return f"❌ Minimum withdrawal is ${MIN_WITHDRAWAL:.2f}."
-    if amount > MAX_WITHDRAWAL:
-        return f"❌ Maximum withdrawal is ${MAX_WITHDRAWAL:.2f}."
+        return f"❌ Insufficient balance. You have ${balance:.2f}."
+    # NEW: enforce min/max withdrawal limits from DB settings
+    min_w, max_w = get_withdraw_limits()
+    if balance < min_w:
+        return f"❌ Your balance (${balance:.2f}) is below the minimum withdrawal of ${min_w:.2f}."
+    if amount < min_w or amount > max_w:
+        return f"❌ Withdrawal amount must be between ${min_w:.2f} and ${max_w:.2f}."
     return None
 
 def process_opay_amount(message):
@@ -4800,6 +5108,9 @@ def get_admin_menu():
         ibtn("Choice SMS", callback_data="admin_choice_sms", style="primary", icon="link"),
         ibtn("Settings", callback_data="admin_settings", style="danger", icon="settings"),
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
+        ibtn("💾 Backup", callback_data="admin_backup", style="success", icon="archive"),
+        ibtn("👤 View Member", callback_data="admin_view_member", style="primary", icon="profile"),
+        ibtn("📩 Message User", callback_data="admin_msg_user", style="primary", icon="chat"),
         ibtn("Leave", callback_data="close_menu", style="danger", icon="back")
     ]
     for i in range(0, len(buttons), 2):
@@ -5360,6 +5671,8 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup.add(ibtn("Broadcast", callback_data="admin_broadcast", style="success", icon="announcement"))
         markup.add(ibtn(f"Real-time OTP [{rt_label}]", callback_data="admin_toggle_rt_otp", style=rt_style, icon="eye"))
         markup.add(ibtn("IVASMS WSS URL", callback_data="admin_set_ivasms_wss", style="primary", icon="link"))
+        markup.add(ibtn(f"\u0024 Min Withdraw (${get_withdraw_limits()[0]:.2f})", callback_data="admin_set_min_withdraw", style="primary", icon="dollar"))
+        markup.add(ibtn(f"\u0024 Max Withdraw (${get_withdraw_limits()[1]:.2f})", callback_data="admin_set_max_withdraw", style="primary", icon="dollar"))
         markup.add(ibtn("Maintenance", callback_data="admin_toggle_maintenance", style="danger", icon="wrench"))
         markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
         bot.edit_message_text("⚙️ <b>Settings</b>", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
@@ -5408,6 +5721,77 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
         bot.edit_message_text("Send new watermark text:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: Admin Message User - two-step flow (user ID, then message)
+    if data == "admin_msg_user":
+        set_state(chat_id, "admin_msg_user_id")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text("\U0001f4e9 <b>MESSAGE USER</b>\n\n\U0001f464 Enter the User ID to message:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: View Member - full member details with add/deduct balance buttons
+    if data == "admin_view_member":
+        set_state(chat_id, "view_member_lookup")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text("👤 <b>VIEW MEMBER</b>\n\nSend the User ID or @username:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("vm_addbal|"):
+        uid = data.split("|")[1]
+        set_state(chat_id, {"vm_balance_target": uid})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text(f"💰 <b>ADD BALANCE</b>\n\nUser: <code>{uid}</code>\n\nSend the amount to ADD (e.g. 1.50):", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("vm_deduct|"):
+        uid = data.split("|")[1]
+        set_state(chat_id, {"vm_deduct_target": uid})
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text(f"💸 <b>DEDUCT BALANCE</b>\n\nUser: <code>{uid}</code>\n\nSend the amount to DEDUCT (e.g. 0.50):", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: Admin sets min/max withdrawal limits (stored in bot_settings)
+    if data == "admin_set_min_withdraw":
+        set_state(chat_id, "set_min_withdraw")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
+        bot.edit_message_text(f"\u0024 <b>SET MIN WITHDRAW</b>\n\nCurrent: <code>${get_withdraw_limits()[0]:.2f}</code>\n\nSend a positive numeric value:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "admin_set_max_withdraw":
+        set_state(chat_id, "set_max_withdraw")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(ibtn("Cancel", callback_data="admin_settings", style="danger", icon="back"))
+        bot.edit_message_text(f"\u0024 <b>SET MAX WITHDRAW</b>\n\nCurrent: <code>${get_withdraw_limits()[1]:.2f}</code>\n\nSend a positive numeric value:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    # NEW: One-click backup - dumps all tables to backup_light_premium.json
+    if data == "admin_backup":
+        try:
+            path, counts = backup_all_tables()
+            size_kb = os.path.getsize(path) / 1024
+            total_rows = sum(counts.values())
+            text = (f"\u2705 <b>Backup Complete</b>\n\n"
+                    f"\U0001f4e6 File: <code>backup_light_premium.json</code>\n"
+                    f"\U0001f4be Size: <code>{size_kb:.1f} KB</code>\n"
+                    f"\U0001f4ca Total rows: <code>{total_rows}</code>\n\n")
+            for t, n in counts.items():
+                if n:
+                    text += f"\u2022 {t}: {n}\n"
+            with open(path, "rb") as f:
+                bot.send_document(chat_id, f, caption=text, parse_mode="HTML")
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Backup failed: {e}")
+            bot.answer_callback_query(call.id, f"\u274c Backup failed: {e}", show_alert=True)
         return
 
     if data == "admin_set_ivasms_wss":
@@ -5973,6 +6357,11 @@ def combo_custom_app_handler(message):
 
 def admin_reject_reason_step(message):
     st = user_states.get(message.chat.id, {})
+    # FIXED: req_id was undefined here - read it from the stored state
+    req_id = st.get("reject_reason") if isinstance(st, dict) else None
+    if not req_id:
+        bot.send_message(message.chat.id, "❌ No pending rejection. Try again.", parse_mode="HTML")
+        return
     reason = message.text if message.text.lower() != '/skip' else "Rejected by admin"
     success, result = reject_withdrawal(req_id, message.chat.id, reason)
     if success:
@@ -6353,6 +6742,317 @@ def set_ivasms_wss_handler(message):
     bot.reply_to(message, f"✅ IVASMS WSS URL updated.", parse_mode="HTML")
     clear_state(message)
 
+# ======================== VIEW MEMBER HANDLERS (NEW) ========================
+@bot.message_handler(func=lambda msg: get_state(msg) == "view_member_lookup" and is_admin(msg.from_user.id))
+def view_member_lookup_handler(message):
+    q = message.text.strip()
+    clear_state(message)
+    uid = None
+    if q.lstrip("@").isdigit():
+        uid = int(q)
+    elif q.startswith("@"):
+        uname = q.lstrip("@").lower()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE LOWER(username)=?", (uname,))
+        r = c.fetchone()
+        conn.close()
+        uid = r[0] if r else None
+    if uid is None:
+        bot.reply_to(message, "\u274c User not found. Send a numeric User ID or @username.", parse_mode="HTML")
+        return
+    _send_member_report(chat_id=message.chat.id, user_id=uid)
+
+def _send_member_report(chat_id, user_id):
+    """Build and send the detailed member report (NEW)."""
+    try:
+        user = get_user(user_id)
+        if not user:
+            bot.send_message(chat_id, f"\u274c User <code>{user_id}</code> not found.", parse_mode="HTML")
+            return
+        # users columns: 0=user_id,1=username,2=first_name,3=last_name,4=country_code,
+        # 5=assigned_number,6=is_banned,7=private_combo_country,8=join_date,9=last_active,10=balance,11=remove_cc
+        username = user[1] or ""
+        first_name = user[2] or ""
+        country_code = user[4] or "N/A"
+        assigned = user[5] or ""
+        is_banned = "Yes" if user[6] else "No"
+        join_date = user[8] or "N/A"
+        last_active = user[9] or "N/A"
+        balance = user[10] if user[10] is not None else 0.0
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Financial
+        c.execute("SELECT COUNT(*) FROM otp_logs WHERE assigned_to=?", (user_id,))
+        total_otps = c.fetchone()[0] or 0
+        c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE user_id=? AND status='approved'", (user_id,))
+        total_withdrawn = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM withdrawal_requests WHERE user_id=? AND status='pending'", (user_id,))
+        pending_wd = c.fetchone()[0] or 0
+        # Referrals
+        c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,))
+        ref_count = c.fetchone()[0] or 0
+        ref_earned = ref_count * REFERRAL_REWARD
+        # Assigned numbers (may be comma-separated)
+        numbers = [n.strip() for n in assigned.split(",") if n.strip()] if assigned else []
+        # Active sessions from number_history (released_at IS NULL = active)
+        c.execute("SELECT number, country_code, assigned_at FROM number_history WHERE user_id=? AND released_at IS NULL ORDER BY id DESC LIMIT 10", (user_id,))
+        active_sessions = c.fetchall()
+        # Activity trail (last 20) - every logged action for this member
+        c.execute("SELECT action, details, timestamp FROM user_activity WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,))
+        activity = c.fetchall()
+        # Number history - every number ever allocated (active + released)
+        c.execute("SELECT number, country_code, assigned_at, released_at FROM number_history WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,))
+        number_hist = c.fetchall()
+        # Recent OTPs (last 5)
+        c.execute("SELECT timestamp, number, otp, service FROM otp_logs WHERE assigned_to=? ORDER BY id DESC LIMIT 5", (user_id,))
+        otps = c.fetchall()
+        conn.close()
+
+        display_name = first_name or (f"@{username}" if username else str(user_id))
+        text = f"\U0001f464 <b>MEMBER REPORT</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        text += f"\U0001f194 ID: <code>{user_id}</code>\n"
+        text += f"\U0001f4db Name: {display_name}\n"
+        text += f"\U0001f464 Username: @{username if username else 'N/A'}\n"
+        text += f"\U0001f30d Country: {country_code}\n"
+        text += f"\U0001f4c5 Joined: {join_date}\n"
+        text += f"\u23f0 Last Active: {last_active}\n"
+        text += f"\U0001f6ab Banned: {is_banned}\n"
+        text += f"\n\U0001f4b0 <b>FINANCIAL</b>\n"
+        text += f"\U0001f4b0 Balance: <b>${balance:.2f}</b>\n"
+        text += f"\U0001f4f2 Total OTPs: {total_otps}\n"
+        text += f"\U0001f4b5 Total Withdrawn: ${total_withdrawn:.2f}\n"
+        text += f"\u23f3 Pending Withdrawals: {pending_wd}\n"
+        text += f"\n\U0001f91d <b>REFERRALS</b>\n"
+        text += f"\U0001f465 Count: {ref_count}\n"
+        text += f"\U0001f4b0 Earned: ${ref_earned:.2f}\n"
+        text += f"\n\U0001f4f1 <b>NUMBERS ALLOCATED (CURRENT)</b>\n"
+        if numbers:
+            for n in numbers:
+                text += f"\U0001f4de <code>{n}</code>\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f504 <b>ACTIVE SESSIONS</b>\n"
+        if active_sessions:
+            for num, cc, ts in active_sessions:
+                text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) since {ts}\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f4dc <b>NUMBER HISTORY (ALL ALLOCATED)</b>\n"
+        if number_hist:
+            for num, cc, a_ts, r_ts in number_hist:
+                if r_ts:
+                    text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) got {a_ts} \u2192 released {r_ts}\n"
+                else:
+                    text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) got {a_ts} \u2014 STILL ACTIVE\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f4cb <b>ACTIVITY LOG (LAST 20)</b>\n"
+        if activity:
+            for action, details, ts in activity:
+                text += f"\u2022 {action} \u2014 {str(details or '')[:40]} ({ts})\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f511 <b>RECENT OTPS</b>\n"
+        if otps:
+            for ts, num, otp, svc in otps:
+                text += f"\u2022 <code>{num}</code> \u2192 <b>{otp}</b> ({svc or 'N/A'}) {ts}\n"
+        else:
+            text += "None\n"
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            ibtn("\u2795 Add Balance", callback_data=f"vm_addbal|{user_id}", style="success", icon="plus"),
+            ibtn("\u2796 Deduct Balance", callback_data=f"vm_deduct|{user_id}", style="danger", icon="minus"),
+        )
+        markup.add(ibtn("Back", callback_data="admin_panel", style="primary", icon="back"))
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"_send_member_report error: {e}")
+        bot.send_message(chat_id, f"\u274c Error building report: {e}", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and "vm_balance_target" in get_state(msg) and is_admin(msg.from_user.id))
+def vm_add_balance_handler(message):
+    st = get_state(message)
+    uid = int(st["vm_balance_target"])
+    clear_state(message)
+    try:
+        amt = float(message.text.strip().replace("$", ""))
+        if amt <= 0:
+            raise ValueError
+        user = get_user(uid)
+        if not user:
+            bot.reply_to(message, "\u274c User not found.", parse_mode="HTML")
+            return
+        current = user[10] if len(user) > 10 and user[10] is not None else 0.0
+        new_bal = current + amt
+        save_user(uid, balance=new_bal)
+        bot.reply_to(message, f"\u2705 Added ${amt:.2f} to user <code>{uid}</code>. New balance: ${new_bal:.2f}", parse_mode="HTML")
+        try:
+            bot.send_message(uid, f"\U0001f4b0 <b>Balance Updated</b>\n+${amt:.2f}\nNew balance: ${new_bal:.2f}", parse_mode="HTML")
+        except Exception:
+            pass
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid amount.", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and "vm_deduct_target" in get_state(msg) and is_admin(msg.from_user.id))
+def vm_deduct_balance_handler(message):
+    st = get_state(message)
+    uid = int(st["vm_deduct_target"])
+    clear_state(message)
+    try:
+        amt = float(message.text.strip().replace("$", ""))
+        if amt <= 0:
+            raise ValueError
+        user = get_user(uid)
+        if not user:
+            bot.reply_to(message, "\u274c User not found.", parse_mode="HTML")
+            return
+        current = user[10] if len(user) > 10 and user[10] is not None else 0.0
+        if amt > current:
+            bot.reply_to(message, f"\u274c User has only ${current:.2f}.", parse_mode="HTML")
+            return
+        new_bal = current - amt
+        save_user(uid, balance=new_bal)
+        bot.reply_to(message, f"\u2705 Deducted ${amt:.2f} from user <code>{uid}</code>. New balance: ${new_bal:.2f}", parse_mode="HTML")
+        try:
+            bot.send_message(uid, f"\U0001f4b0 <b>Balance Updated</b>\n-${amt:.2f}\nNew balance: ${new_bal:.2f}", parse_mode="HTML")
+        except Exception:
+            pass
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid amount.", parse_mode="HTML")
+
+# ======================== ADMIN MESSAGE USER (NEW) ========================
+def _admin_send_message(admin_id, target_uid, msg_text):
+    """Core admin-to-user message sender. Returns (ok, error_text)."""
+    try:
+        user = get_user(target_uid)
+        if not user:
+            return False, f"\u274c User <code>{target_uid}</code> not found in the users table."
+        if not msg_text or not msg_text.strip():
+            return False, "\u274c Message cannot be empty."
+        # Escape HTML so user-typed < > & don't break parse_mode
+        safe = html_mod.escape(msg_text.strip())
+        text = (
+            f"\U0001f4e9 <b>Admin Message</b>\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"{safe}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"<i>This is an official message from the bot admin.</i>"
+        )
+        try:
+            bot.send_message(target_uid, text, parse_mode="HTML")
+        except telebot.apihelper.ApiTelegramException as te:
+            code = getattr(te, "error_code", 0)
+            if code == 403:
+                return False, f"\u274c User <code>{target_uid}</code> has blocked the bot."
+            if code == 400:
+                return False, f"\u274c Chat not found for user <code>{target_uid}</code>."
+            return False, f"\u274c Telegram error {code}: {te}"
+        # Log to admin_logs (action: admin_msg, details: user_id + preview)
+        try:
+            with _db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("INSERT INTO admin_logs (admin_id, action, details) VALUES (?, ?, ?)",
+                          (admin_id, "admin_msg", f"user_id={target_uid} | msg={msg_text.strip()[:100]}"))
+                conn.commit()
+                conn.close()
+        except Exception as log_err:
+            logger.error(f"admin_msg log failed: {log_err}")
+        return True, None
+    except Exception as e:
+        logger.error(f"_admin_send_message error: {e}")
+        return False, f"\u274c Error: {e}"
+
+@bot.message_handler(commands=['msg'])
+def admin_msg_command(message):
+    """/msg <user_id> <message> - admin-only direct message."""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "\u26a0\ufe0f Admin only.", parse_mode="HTML")
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "\u26a0\ufe0f Usage: <code>/msg &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        target_uid = int(parts[1].strip())
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid user ID. Usage: <code>/msg &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    ok, err = _admin_send_message(message.from_user.id, target_uid, parts[2])
+    if ok:
+        bot.reply_to(message, f"\u2705 Message sent to <code>{target_uid}</code>.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, err, parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "admin_msg_user_id" and is_admin(msg.from_user.id))
+def admin_msg_user_id_handler(message):
+    raw = message.text.strip()
+    if raw.lstrip("@").isdigit():
+        try:
+            uid = int(raw)
+        except ValueError:
+            uid = None
+    else:
+        uid = None
+    if uid is None:
+        bot.reply_to(message, "\u274c Invalid ID. Send a numeric User ID (or /cancel):", parse_mode="HTML")
+        return
+    if not get_user(uid):
+        bot.reply_to(message, f"\u274c User <code>{uid}</code> not found. Send a valid User ID (or /cancel):", parse_mode="HTML")
+        return
+    set_state(message.chat.id, {"state": "admin_msg_text", "target_user": uid})
+    bot.reply_to(message, f"\u270d\ufe0f Send the message to send to user <code>{uid}</code> (or /cancel):", parse_mode="HTML")
+
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("state") == "admin_msg_text" and is_admin(msg.from_user.id))
+def admin_msg_text_handler(message):
+    st = get_state(message)
+    uid = st.get("target_user")
+    clear_state(message)
+    if not message.text or not message.text.strip():
+        bot.reply_to(message, "\u274c Message cannot be empty.", parse_mode="HTML")
+        return
+    ok, err = _admin_send_message(message.from_user.id, uid, message.text)
+    if ok:
+        bot.reply_to(message, f"\u2705 Message sent to <code>{uid}</code>.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, err, parse_mode="HTML")
+
+# ======================== SET MIN/MAX WITHDRAW HANDLERS (NEW) ========================
+@bot.message_handler(func=lambda msg: get_state(msg) == "set_min_withdraw" and is_admin(msg.from_user.id))
+def set_min_withdraw_handler(message):
+    try:
+        val = float(message.text.strip().replace("$", ""))
+        if val <= 0:
+            raise ValueError
+        max_w = get_withdraw_limits()[1]
+        if val > max_w:
+            bot.reply_to(message, f"\u274c Min withdraw (${val:.2f}) cannot be greater than max withdraw (${max_w:.2f}).", parse_mode="HTML")
+            return
+        set_setting('min_withdraw', str(val))
+        bot.reply_to(message, f"\u2705 Min withdraw set to <b>${val:.2f}</b>", parse_mode="HTML")
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid number. Send a positive value, e.g. 1.00", parse_mode="HTML")
+    clear_state(message)
+
+@bot.message_handler(func=lambda msg: get_state(msg) == "set_max_withdraw" and is_admin(msg.from_user.id))
+def set_max_withdraw_handler(message):
+    try:
+        val = float(message.text.strip().replace("$", ""))
+        if val <= 0:
+            raise ValueError
+        min_w = get_withdraw_limits()[0]
+        if val < min_w:
+            bot.reply_to(message, f"\u274c Max withdraw (${val:.2f}) cannot be less than min withdraw (${min_w:.2f}).", parse_mode="HTML")
+            return
+        set_setting('max_withdraw', str(val))
+        bot.reply_to(message, f"\u2705 Max withdraw set to <b>${val:.2f}</b>", parse_mode="HTML")
+    except ValueError:
+        bot.reply_to(message, "\u274c Invalid number. Send a positive value, e.g. 5.00", parse_mode="HTML")
+    clear_state(message)
+
 @bot.message_handler(func=lambda msg: get_state(msg) == "add_force_channel" and is_admin(msg.from_user.id))
 def add_force_channel_handler(message):
     url = message.text.strip()
@@ -6653,6 +7353,11 @@ def periodic_cleanup():
             logger.error(f"Periodic cleanup error: {e}")
 
 def main():
+    # NEW: Auto-restore from backup if DB is empty
+    try:
+        auto_restore_if_empty()
+    except Exception as e:
+        logger.error(f"Auto-restore failed: {e}")
     # Log DB status on startup
     try:
         otp_count = get_total_otp_count()
