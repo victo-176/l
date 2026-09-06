@@ -1557,6 +1557,57 @@ def load_data():
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ======================== LIVE SUPPORT ========================
+
+# ======================== MEDIA HELPERS (shared) ========================
+MEDIA_CONTENT_TYPES = ['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation', 'sticker', 'video_note']
+
+def _extract_media(message):
+    """Return (content_type, file_id, caption) for media messages, or None for text."""
+    ct = message.content_type
+    caption = getattr(message, 'caption', None)
+    try:
+        if ct == 'photo':
+            return ('photo', message.photo[-1].file_id, caption)
+        if ct == 'video':
+            return ('video', message.video.file_id, caption)
+        if ct == 'document':
+            return ('document', message.document.file_id, caption)
+        if ct == 'audio':
+            return ('audio', message.audio.file_id, caption)
+        if ct == 'voice':
+            return ('voice', message.voice.file_id, caption)
+        if ct == 'animation':
+            return ('animation', message.animation.file_id, caption)
+        if ct == 'sticker':
+            return ('sticker', message.sticker.file_id, None)
+        if ct == 'video_note':
+            return ('video_note', message.video_note.file_id, None)
+    except Exception as e:
+        logger.error(f"[Media] Extract failed for {ct}: {e}")
+    return None
+
+def _send_media(uid, content_type, file_id, caption=None):
+    """Send media by type with optional HTML caption. Raises on failure."""
+    pm = "HTML" if caption else None
+    if content_type == 'photo':
+        bot.send_photo(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'video':
+        bot.send_video(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'document':
+        bot.send_document(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'audio':
+        bot.send_audio(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'voice':
+        bot.send_voice(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'animation':
+        bot.send_animation(uid, file_id, caption=caption, parse_mode=pm)
+    elif content_type == 'sticker':
+        bot.send_sticker(uid, file_id)
+    elif content_type == 'video_note':
+        bot.send_video_note(uid, file_id)
+    else:
+        bot.send_message(uid, caption or " ", parse_mode=pm)
+
 @bot.callback_query_handler(func=lambda call: call.data == "live_support_start")
 def live_support_start(call):
     """User wants to send a message to admin."""
@@ -1577,18 +1628,18 @@ def live_support_start(call):
         parse_mode="HTML", reply_markup=markup
     )
 
-@bot.message_handler(func=lambda msg: get_state(msg) == "live_support_msg" and msg.text and not msg.text.startswith("/"))
+@bot.message_handler(func=lambda msg: get_state(msg) == "live_support_msg" and msg.content_type in MEDIA_CONTENT_TYPES and not (msg.text and msg.text.startswith("/")), content_types=MEDIA_CONTENT_TYPES)
 def live_support_send(message):
-    """Forward user's support message to admin(s)."""
+    """Forward user's support message (text OR any media) to admin(s)."""
     user_id = message.from_user.id
     chat_id = message.chat.id
-    text = message.text.strip() if message.text else ""
     clear_state(message)
-    logger.info(f"Live support: User {user_id} sending: {text[:50]}")
-    if not text:
+    text = message.text.strip() if message.text else ""
+    media = _extract_media(message)
+    if not text and not media:
         bot.reply_to(message, "\u274c Message cannot be empty.", parse_mode="HTML")
         return
-    # Forward to all admins
+    logger.info(f"Live support: User {user_id} sending ({message.content_type})")
     admins = get_all_admins()
     sent = False
     for admin_id in admins:
@@ -1601,18 +1652,26 @@ def live_support_send(message):
             display = first_name or (f"@{username}" if username else str(user_id))
             pe_c3 = pe('chat', '\U0001F4AC')
             pe_p = pe('people', '\U0001F465')
-            admin_msg = (
+            header = (
                 f"{pe_c3} <b>SUPPORT MESSAGE</b>\n"
-                f"━━━━━━━━━━━━━━━\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 f"{pe_p} <b>From:</b> {display} (<code>{user_id}</code>)\n"
-                f"{pe_c3} <b>Message:</b>\n"
-                f"<code>{text[:500]}</code>\n"
-                f"━━━━━━━━━━━━━━━"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
             )
-            # Add reply button for admin
             kb = types.InlineKeyboardMarkup()
             kb.add(ibtn(f"Reply to {display}", callback_data=f"support_reply|{user_id}", style="success", icon="chat"))
-            bot.send_message(admin_id, admin_msg, parse_mode="HTML", reply_markup=kb)
+            if media:
+                # Send header, then the media, then reply button (send header+button via reply)
+                bot.send_message(admin_id, header, parse_mode="HTML")
+                _send_media(admin_id, media[0], media[1], media[2])
+                # attach reply button to a small follow-up or resend on header
+                try:
+                    bot.send_message(admin_id, "\u200b", reply_markup=kb)
+                except Exception:
+                    pass
+            else:
+                admin_msg = header + f"\n{pe_c3} <b>Message:</b>\n<code>{text[:500]}</code>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+                bot.send_message(admin_id, admin_msg, parse_mode="HTML", reply_markup=kb)
             sent = True
         except Exception as send_err:
             logger.error(f"Live support: Failed to send to admin {admin_id}: {send_err}")
@@ -1620,18 +1679,15 @@ def live_support_send(message):
         logger.warning("Live support: No admins found to send to!")
         bot.send_message(chat_id, "\u274c No admins configured. Cannot send message.", parse_mode="HTML")
         return
+    pe_ck = pe('checkmark', '\u2705') if sent else pe('cross', '\u274C')
     if sent:
-        pe_ck = pe('checkmark', '\u2705')
         bot.send_message(chat_id,
             f"{pe_ck} <b>MESSAGE SENT!</b>\n\n"
             f"Your message has been forwarded to the admin.\n"
             f"They will reply shortly.",
             parse_mode="HTML")
     else:
-        pe_x = pe('cross', '\u274C')
-        bot.send_message(chat_id,
-            f"{pe_x} <b>Failed to send message.</b>\nPlease try again later.",
-            parse_mode="HTML")
+        bot.send_message(chat_id, f"{pe_ck} <b>Failed to send message.</b>\nPlease try again later.", parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("support_reply|") and is_admin(call.from_user.id))
 def admin_support_reply_start(call):
@@ -1656,27 +1712,35 @@ def admin_support_reply_start(call):
         parse_mode="HTML", reply_markup=markup
     )
 
-@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("support_reply_to") and is_admin(msg.from_user.id))
+@bot.message_handler(func=lambda msg: isinstance(get_state(msg), dict) and get_state(msg).get("support_reply_to") and is_admin(msg.from_user.id), content_types=MEDIA_CONTENT_TYPES)
 def admin_support_reply_send(message):
     """Admin sends reply to user."""
     try:
         state = get_state(message)
         target_user = state.get("support_reply_to") if state else None
         text = message.text.strip() if message.text else ""
+        media = _extract_media(message)
         clear_state(message)
-        logger.info(f"Admin reply: Sending to user {target_user}, text: {text[:50]}")
-        if not text or not target_user:
+        logger.info(f"Admin reply: Sending to user {target_user}, type: {message.content_type}")
+        if (not text and not media) or not target_user:
             bot.reply_to(message, "\u274c Empty message or no target user.", parse_mode="HTML")
             return
         pe_s = pe('support', '\U0001F3A7')
-        reply_msg = (
-            f"{pe_s} <b>SUPPORT REPLY</b>\n"
-            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"{text}\n"
-            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"<i>Reply from admin</i>"
-        )
-        bot.send_message(target_user, reply_msg, parse_mode="HTML")
+        if media:
+            bot.send_message(target_user, f"{pe_s} <b>SUPPORT REPLY</b>", parse_mode="HTML")
+            cap = media[2]
+            if cap:
+                cap = f"{cap}\n\n<i>Reply from admin</i>"
+            _send_media(target_user, media[0], media[1], cap)
+        else:
+            reply_msg = (
+                f"{pe_s} <b>SUPPORT REPLY</b>\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"{text}\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"<i>Reply from admin</i>"
+            )
+            bot.send_message(target_user, reply_msg, parse_mode="HTML")
         logger.info(f"Admin reply: Successfully sent to user {target_user}")
         pe_ck2 = pe('checkmark', '\u2705')
         bot.reply_to(message, f"{pe_ck2} Reply sent to user <code>{target_user}</code>.", parse_mode="HTML")
