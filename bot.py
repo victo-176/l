@@ -6578,9 +6578,12 @@ def _send_member_report(chat_id, user_id):
         # Active sessions from number_history (released_at IS NULL = active)
         c.execute("SELECT number, country_code, assigned_at FROM number_history WHERE user_id=? AND released_at IS NULL ORDER BY id DESC LIMIT 10", (user_id,))
         active_sessions = c.fetchall()
-        # Recent activity (last 5)
-        c.execute("SELECT action, details, timestamp FROM user_activity WHERE user_id=? ORDER BY id DESC LIMIT 5", (user_id,))
+        # Activity trail (last 20) - every logged action for this member
+        c.execute("SELECT action, details, timestamp FROM user_activity WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,))
         activity = c.fetchall()
+        # Number history - every number ever allocated (active + released)
+        c.execute("SELECT number, country_code, assigned_at, released_at FROM number_history WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,))
+        number_hist = c.fetchall()
         # Recent OTPs (last 5)
         c.execute("SELECT timestamp, number, otp, service FROM otp_logs WHERE assigned_to=? ORDER BY id DESC LIMIT 5", (user_id,))
         otps = c.fetchall()
@@ -6603,7 +6606,7 @@ def _send_member_report(chat_id, user_id):
         text += f"\n\U0001f91d <b>REFERRALS</b>\n"
         text += f"\U0001f465 Count: {ref_count}\n"
         text += f"\U0001f4b0 Earned: ${ref_earned:.2f}\n"
-        text += f"\n\U0001f4f1 <b>ASSIGNED NUMBERS</b>\n"
+        text += f"\n\U0001f4f1 <b>NUMBERS ALLOCATED (CURRENT)</b>\n"
         if numbers:
             for n in numbers:
                 text += f"\U0001f4de <code>{n}</code>\n"
@@ -6615,7 +6618,16 @@ def _send_member_report(chat_id, user_id):
                 text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) since {ts}\n"
         else:
             text += "None\n"
-        text += f"\n\U0001f4cb <b>RECENT ACTIVITY</b>\n"
+        text += f"\n\U0001f4dc <b>NUMBER HISTORY (ALL ALLOCATED)</b>\n"
+        if number_hist:
+            for num, cc, a_ts, r_ts in number_hist:
+                if r_ts:
+                    text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) got {a_ts} \u2192 released {r_ts}\n"
+                else:
+                    text += f"\u2022 <code>{num}</code> ({cc or 'N/A'}) got {a_ts} \u2014 STILL ACTIVE\n"
+        else:
+            text += "None\n"
+        text += f"\n\U0001f4cb <b>ACTIVITY LOG (LAST 20)</b>\n"
         if activity:
             for action, details, ts in activity:
                 text += f"\u2022 {action} \u2014 {str(details or '')[:40]} ({ts})\n"
