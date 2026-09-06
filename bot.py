@@ -528,6 +528,7 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('maintenance', '0')")
         # NEW: Global withdrawal limits (REAL, stored as strings in bot_settings)
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('min_withdraw', '1.0')")
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('usd_to_ngn', '1337.73')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('max_withdraw', '5.0')")
         c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('main_otp_link', 'https://t.me/THELIGHTSMS000')")
         # Ensure no duplicate numbers across users (migration for existing DBs)
@@ -751,6 +752,41 @@ def auto_restore_if_empty():
                 pass
     except Exception as e:
         logger.error(f"auto_restore_if_empty error: {e}")
+
+def get_usd_to_ngn():
+    """USD->NGN rate from DB settings (default 1337.73)."""
+    try:
+        return float(get_setting('usd_to_ngn') or 1337.73)
+    except (TypeError, ValueError):
+        return 1337.73
+
+def notify_admins_new_withdrawal(user_id, amount, method, account_no, full_name=""):
+    """Send the formatted NEW WITHDRAWAL REQUEST card to all admins."""
+    import html as _html
+    rate = get_usd_to_ngn()
+    amount_ngn = amount * rate
+    user = get_user(user_id)
+    first_name = user[2] if user and len(user) > 2 else ""
+    username = user[1] if user and len(user) > 1 else ""
+    display = _html.escape(first_name or "User")
+    uname = f"(@{_html.escape(username)})" if username else ""
+    pe_card = pe('card', '\U0001F4B3')
+    msg = (
+        f"{pe_card} <b>NEW WITHDRAWAL REQUEST</b>\n\n"
+        f"<b>Telegram:</b> {display} {uname}\n"
+        f"<b>User ID:</b> <code>{user_id}</code>\n"
+        f"<b>Account Name:</b> {_html.escape(full_name or 'Not provided')}\n\n"
+        f"<b>Amount (USD):</b> ${amount:,.2f}\n"
+        f"<b>Rate:</b> 1 USD = \u20a6{rate:,.2f}\n"
+        f"<b>Amount (NGN):</b> \u20a6{amount_ngn:,.2f}\n\n"
+        f"<b>Method:</b> {_html.escape(str(method).upper())}\n"
+        f"<b>Account No:</b> <code>{_html.escape(str(account_no or 'N/A'))}</code>"
+    )
+    for admin in get_all_admins():
+        try:
+            bot.send_message(admin, msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"[WithdrawNotify] Failed to notify admin {admin}: {e}")
 
 def get_withdraw_limits():
     """Load min/max withdrawal from DB settings (defaults 1.0 / 5.0)."""
@@ -4852,11 +4888,7 @@ def process_opay_amount(message):
         "full_name": details.get("withdraw_name", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via Opay submitted for approval.", parse_mode="HTML")
-    for admin in get_all_admins():
-        try:
-            bot.send_message(admin, f"{pe('card', '💳')} <b>New Withdrawal</b>\nUser: <code>{user_id}</code>\nAmount: ${amount:.2f}\nMethod: Opay\nPhone: {details.get('withdraw_phone', '')}", parse_mode="HTML")
-        except:
-            pass
+    notify_admins_new_withdrawal(user_id, amount, "OPay", details.get("withdraw_phone", "") if details else "", details.get("withdraw_name", "") if details else "")
     user_states.pop(user_id, None)
 
 def process_usdt_address(message):
@@ -4888,11 +4920,7 @@ def process_usdt_amount(message):
     address = user_states.get(user_id, {}).get("withdraw_address", "")
     req_id = create_withdrawal_request(user_id, amount, "usdt", {"address": address})
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via USDT submitted.", parse_mode="HTML")
-    for admin in get_all_admins():
-        try:
-            bot.send_message(admin, f"{pe('card', '💳')} <b>New Withdrawal</b>\nUser: <code>{user_id}</code>\nAmount: ${amount:.2f}\nMethod: USDT\nAddress: {address}", parse_mode="HTML")
-        except:
-            pass
+    notify_admins_new_withdrawal(user_id, amount, "USDT", address, "")
     user_states.pop(user_id, None)
 
 def process_upi_id(message):
@@ -4940,11 +4968,7 @@ def process_upi_amount(message):
         "full_name": details.get("withdraw_name", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via UPI submitted.", parse_mode="HTML")
-    for admin in get_all_admins():
-        try:
-            bot.send_message(admin, f"{pe('card', '💳')} <b>New Withdrawal</b>\nUser: <code>{user_id}</code>\nAmount: ${amount:.2f}\nMethod: UPI\nUPI: {details.get('withdraw_upi', '')}", parse_mode="HTML")
-        except:
-            pass
+    notify_admins_new_withdrawal(user_id, amount, "UPI", details.get("withdraw_upi", "") if details else "", details.get("withdraw_name", "") if details else "")
     user_states.pop(user_id, None)
 
 def process_others_country(message):
@@ -5016,11 +5040,7 @@ def process_others_amount(message):
         "bank_name": details.get("others_bank", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via Other submitted.", parse_mode="HTML")
-    for admin in get_all_admins():
-        try:
-            bot.send_message(admin, f"{pe('card', '💳')} <b>New Withdrawal</b>\nUser: <code>{user_id}</code>\nAmount: ${amount:.2f}\nMethod: Others\nDetails: {details}", parse_mode="HTML")
-        except:
-            pass
+    notify_admins_new_withdrawal(user_id, amount, "Others", details.get("others_account", "") if details else "", details.get("others_holder", "") if details else "")
     user_states.pop(user_id, None)
 
 # =========================== PREDEFINED PANELS (48 PANELS) ===========================
