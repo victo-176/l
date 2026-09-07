@@ -5699,13 +5699,19 @@ def handle_admin_callback(call, data, chat_id, msg_id):
             label = f"💰 ${amount:.2f} — {full_name or uid} ({method})"
             markup.add(ibtn(label, callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"))
         markup.add(ibtn("Back", callback_data="admin_withdrawals", style="primary", icon="back"))
-        bot.edit_message_text("Select withdrawal to reject:", chat_id, msg_id, reply_markup=markup)
+        try:
+            bot.edit_message_text("Select withdrawal to reject:", chat_id, msg_id, reply_markup=markup)
+        except Exception:
+            pass
         return
 
     if data.startswith("admin_reject_wd|"):
         req_id = data.split("|")[1]
         set_state(chat_id, {"reject_reason": req_id})
-        bot.edit_message_text("📝 Enter reason for rejection (or /skip):", chat_id, msg_id, parse_mode="HTML")
+        try:
+            bot.edit_message_text("📝 Enter reason for rejection (or /skip):", chat_id, msg_id, parse_mode="HTML")
+        except Exception:
+            pass
         bot.register_next_step_handler_by_chat_id(chat_id, admin_reject_reason_step)
         return
 
