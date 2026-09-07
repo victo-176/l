@@ -716,22 +716,49 @@ def restore_from_backup():
             conn.close()
 
 def auto_restore_if_empty():
-    """On startup: if the users table is empty and a backup file exists, restore it."""
+    """On FIRST boot only: if DB is empty and a backup file exists, restore it.
+    Sets db_initialized=1 after first successful run to prevent future overwrites."""
     try:
-        if not os.path.exists(BACKUP_FILE):
-            return
+        # Check if we've already initialized — if so, NEVER auto-restore
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        empty = (c.fetchone()[0] or 0) == 0
+        try:
+            c.execute("SELECT value FROM bot_settings WHERE key='db_initialized'")
+            row = c.fetchone()
+            if row and row[0] == '1':
+                conn.close()
+                return  # Already initialized — do not touch the DB
+        except Exception:
+            pass  # Table might not exist yet, continue
+
+        # Check if DB has any data at all (across all critical tables)
+        has_data = False
+        for tbl in ['users', 'otp_logs', 'seen_otps', 'number_app_assignments']:
+            try:
+                c.execute(f"SELECT COUNT(*) FROM {tbl}")
+                cnt = c.fetchone()[0] or 0
+                if cnt > 0:
+                    has_data = True
+                    break
+            except Exception:
+                pass
         conn.close()
-        if not empty:
+
+        if has_data:
             logger.info("Backup restore skipped: DB already has data")
+            # Mark as initialized so we never try again
+            set_setting('db_initialized', '1')
             return
-        logger.info("DB is empty and backup file found — restoring...")
+
+        if not os.path.exists(BACKUP_FILE):
+            return
+
+        logger.info("DB is empty and backup file found — restoring from backup...")
         ok, info = restore_from_backup()
         if ok:
             logger.info(f"Auto-restore complete: {info}")
+            # Mark as initialized so we never overwrite again on future restarts
+            set_setting('db_initialized', '1')
             try:
                 for admin_id in ADMIN_IDS:
                     try:
@@ -5900,6 +5927,8 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         bot.answer_callback_query(call.id, "\U0001f4e6 Creating backup...", show_alert=False)
         try:
             path, counts = backup_all_tables()
+            # Mark DB as initialized so auto-restore never overwrites it again
+            set_setting('db_initialized', '1')
             size_kb = os.path.getsize(path) / 1024
             total_rows = sum(counts.values())
             # Send the backup file to admin
