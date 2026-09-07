@@ -1596,7 +1596,7 @@ def create_withdrawal_request(user_id, amount, method, details):
 def get_pending_withdrawals():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, user_id, amount, payment_method, timestamp FROM withdrawal_requests WHERE status='pending'")
+    c.execute("SELECT id, user_id, amount, payment_method, phone, full_name, address, timestamp FROM withdrawal_requests WHERE status='pending'")
     rows = c.fetchall()
     conn.close()
     return rows
@@ -5589,16 +5589,68 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         if not pending:
             text += "No pending requests."
         else:
-            for w in pending:
-                req_id, uid, amount, method, ts = w
-                text += f"ID: {req_id[:6]}\nUser: <code>{uid}</code>\n${amount:.2f} | {method}\n{ts}\n───────────\n"
-            text += f"\nTotal: {len(pending)}"
-        markup = types.InlineKeyboardMarkup(row_width=2)
+            text += f"Total: {len(pending)} pending\n\nClick a request below for full details."
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for w in pending:
+            req_id, uid, amount, method, phone, full_name, address, ts = w
+            label = f"💰 ${amount:.2f} — {full_name or uid} ({method})"
+            markup.add(ibtn(label, callback_data=f"admin_view_wd|{req_id}", style="primary", icon="card"))
         if pending:
-            markup.add(ibtn("Approve", callback_data="admin_approve_withdrawal", style="success", icon="checkmark"))
-            markup.add(ibtn("Reject", callback_data="admin_reject_withdrawal", style="danger", icon="cross"))
+            markup.add(ibtn("━━━━━━━━━━━━━━━━━━", callback_data="noop_btn"))
         markup.add(ibtn("Refresh", callback_data="admin_withdrawals", style="primary", icon="refresh"))
         markup.add(ibtn("Back", callback_data="admin_panel", style="danger", icon="back"))
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("admin_view_wd|"):
+        req_id = data.split("|")[1]
+        # Fetch full details from DB
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT user_id, amount, payment_method, phone, full_name, address, timestamp FROM withdrawal_requests WHERE id=?", (req_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            bot.answer_callback_query(call.id, "Request not found.", show_alert=True)
+            return
+        uid, amount, method, phone, full_name, address, ts = row
+        rate = get_usd_to_ngn()
+        ngn = amount * rate
+        # Get user info
+        user_info = None
+        try:
+            u = get_user(uid)
+            if u:
+                user_info = u
+        except:
+            pass
+        display_name = ""
+        username_str = ""
+        if user_info:
+            first_nm = user_info[2] or ""
+            user_nm = user_info[1] or ""
+            display_name = html_mod.escape(first_nm) if first_nm else str(uid)
+            username_str = f" (@{{html_mod.escape(user_nm)}})" if user_nm else ""
+        else:
+            display_name = str(uid)
+        acct = html_mod.escape(full_name or "")
+        acct_no = html_mod.escape(str(phone or address or ""))
+        text = (
+            f"💳 <b>WITHDRAWAL REQUEST</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Telegram:</b> {display_name}{username_str}\n"
+            f"<b>User ID:</b> <code>{uid}</code>\n"
+            f"<b>Account Name:</b> {acct}\n\n"
+            f"<b>Amount (USD):</b> ${amount:,.2f}\n"
+            f"<b>Rate:</b> 1 USD = ₦{rate:,.2f}\n"
+            f"<b>Amount (NGN):</b> ₦{ngn:,.2f}\n\n"
+            f"<b>Method:</b> {html_mod.escape(str(method or 'N/A')).upper()}\n"
+            f"<b>Account No:</b> <code>{acct_no}</code>"
+        )
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(ibtn("✅ Approve", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"))
+        markup.add(ibtn("❌ Decline", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"))
+        markup.add(ibtn("Back", callback_data="admin_withdrawals", style="primary", icon="back"))
         bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
 
@@ -5608,8 +5660,10 @@ def handle_admin_callback(call, data, chat_id, msg_id):
             bot.answer_callback_query(call.id, "No pending.", show_alert=True)
             return
         markup = types.InlineKeyboardMarkup(row_width=1)
-        for req_id, uid, amount, method, _ in pending:
-            markup.add(ibtn(f"{uid} - ${amount:.2f} ({method})", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"))
+        for w in pending:
+            req_id, uid, amount, method, phone, full_name, address, ts = w
+            label = f"💰 ${amount:.2f} — {full_name or uid} ({method})"
+            markup.add(ibtn(label, callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"))
         markup.add(ibtn("Back", callback_data="admin_withdrawals", style="primary", icon="back"))
         bot.edit_message_text("Select withdrawal to approve:", chat_id, msg_id, reply_markup=markup)
         return
@@ -5640,8 +5694,10 @@ def handle_admin_callback(call, data, chat_id, msg_id):
             bot.answer_callback_query(call.id, "No pending.", show_alert=True)
             return
         markup = types.InlineKeyboardMarkup(row_width=1)
-        for req_id, uid, amount, method, _ in pending:
-            markup.add(ibtn(f"{uid} - ${amount:.2f} ({method})", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"))
+        for w in pending:
+            req_id, uid, amount, method, phone, full_name, address, ts = w
+            label = f"💰 ${amount:.2f} — {full_name or uid} ({method})"
+            markup.add(ibtn(label, callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"))
         markup.add(ibtn("Back", callback_data="admin_withdrawals", style="primary", icon="back"))
         bot.edit_message_text("Select withdrawal to reject:", chat_id, msg_id, reply_markup=markup)
         return
