@@ -760,7 +760,7 @@ def get_usd_to_ngn():
     except (TypeError, ValueError):
         return 1337.73
 
-def notify_admins_new_withdrawal(user_id, amount, method, account_no, full_name=""):
+def notify_admins_new_withdrawal(user_id, amount, method, account_no, full_name="", req_id=None):
     """Send the formatted NEW WITHDRAWAL REQUEST card to all admins."""
     import html as _html
     rate = get_usd_to_ngn()
@@ -782,11 +782,13 @@ def notify_admins_new_withdrawal(user_id, amount, method, account_no, full_name=
         f"<b>Method:</b> {_html.escape(str(method).upper())}\n"
         f"<b>Account No:</b> <code>{_html.escape(str(account_no or 'N/A'))}</code>"
     )
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        ibtn("Approve", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"),
-        ibtn("Decline", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"),
-    )
+    markup = None
+    if req_id:
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            ibtn("Approve", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"),
+            ibtn("Decline", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"),
+        )
     for admin in get_all_admins():
         try:
             bot.send_message(admin, msg, parse_mode="HTML", reply_markup=markup)
@@ -4893,7 +4895,7 @@ def process_opay_amount(message):
         "full_name": details.get("withdraw_name", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via Opay submitted for approval.", parse_mode="HTML")
-    notify_admins_new_withdrawal(user_id, amount, "OPay", details.get("withdraw_phone", "") if details else "", details.get("withdraw_name", "") if details else "")
+    notify_admins_new_withdrawal(user_id, amount, "OPay", details.get("withdraw_phone", "") if details else "", details.get("withdraw_name", "") if details else "", req_id=req_id)
     user_states.pop(user_id, None)
 
 def process_usdt_address(message):
@@ -4925,7 +4927,7 @@ def process_usdt_amount(message):
     address = user_states.get(user_id, {}).get("withdraw_address", "")
     req_id = create_withdrawal_request(user_id, amount, "usdt", {"address": address})
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via USDT submitted.", parse_mode="HTML")
-    notify_admins_new_withdrawal(user_id, amount, "USDT", address, "")
+    notify_admins_new_withdrawal(user_id, amount, "USDT", address, "", req_id=req_id)
     user_states.pop(user_id, None)
 
 def process_upi_id(message):
@@ -4973,7 +4975,7 @@ def process_upi_amount(message):
         "full_name": details.get("withdraw_name", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via UPI submitted.", parse_mode="HTML")
-    notify_admins_new_withdrawal(user_id, amount, "UPI", details.get("withdraw_upi", "") if details else "", details.get("withdraw_name", "") if details else "")
+    notify_admins_new_withdrawal(user_id, amount, "UPI", details.get("withdraw_upi", "") if details else "", details.get("withdraw_name", "") if details else "", req_id=req_id)
     user_states.pop(user_id, None)
 
 def process_others_country(message):
@@ -5045,7 +5047,7 @@ def process_others_amount(message):
         "bank_name": details.get("others_bank", "")
     })
     bot.reply_to(message, f"✅ Withdrawal request of ${amount:.2f} via Other submitted.", parse_mode="HTML")
-    notify_admins_new_withdrawal(user_id, amount, "Others", details.get("others_account", "") if details else "", details.get("others_holder", "") if details else "")
+    notify_admins_new_withdrawal(user_id, amount, "Others", details.get("others_account", "") if details else "", details.get("others_holder", "") if details else "", req_id=req_id)
     user_states.pop(user_id, None)
 
 # =========================== PREDEFINED PANELS (48 PANELS) ===========================
@@ -5154,7 +5156,8 @@ def get_admin_menu():
         ibtn("Admins", callback_data="admin_manage_admins", style="primary", icon="admin"),
         ibtn("💾 Backup", callback_data="admin_backup", style="success", icon="archive"),
         ibtn("👤 View Member", callback_data="admin_view_member", style="primary", icon="profile"),
-        ibtn("📩 Message User", callback_data="admin_msg_user", style="primary", icon="chat"),
+        ibtn("📩 Message User", callback_data="admin_msg_user", style="primary", icon="chat"),        ibtn("🧾 Clear Balances", callback_data="admin_clear_balances", style="danger", icon="dollar"),
+
         ibtn("Leave", callback_data="close_menu", style="danger", icon="back")
     ]
     for i in range(0, len(buttons), 2):
@@ -5943,6 +5946,37 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         return
 
     # === BROADCAST ===
+    if data == "admin_clear_balances":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM users WHERE COALESCE(balance,0) > 0")
+        cnt, total = c.fetchone()
+        conn.close()
+        text = (f"\U0001F9FE <b>CLEAR ALL BALANCES</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"Members with balance: <b>{cnt}</b>\n"
+                f"Total to wipe: <b>${total:,.2f}</b>\n\n"
+                f"\u26a0\uFE0F This sets EVERY member's balance to $0.00.\n"
+                f"This cannot be undone!")
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            ibtn("CONFIRM WIPE", callback_data="admin_clear_balances_confirm", style="danger", icon="cross"),
+            ibtn("Cancel", callback_data="admin_panel", style="primary", icon="back"),
+        )
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "admin_clear_balances_confirm":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance=0 WHERE COALESCE(balance,0) > 0")
+        wiped = c.rowcount
+        conn.commit()
+        conn.close()
+        logger.info(f"[Admin] {chat_id} wiped balances for {wiped} users")
+        bot.answer_callback_query(call.id, f"\u2705 {wiped} balances cleared", show_alert=True)
+        handle_admin_callback(call, "admin_panel", chat_id, msg_id)
+        return
+
     if data == "admin_broadcast":
         set_state(chat_id, "admin_broadcast_msg")
         markup = types.InlineKeyboardMarkup()
