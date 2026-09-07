@@ -2111,6 +2111,10 @@ def _safe_edit_message_text(text, chat_id=None, message_id=None, *args, **kwargs
     try:
         return _orig_edit_message_text(text, chat_id=chat_id, message_id=message_id, *args, **kwargs)
     except Exception as e:
+        # Silently ignore "message not modified" (same content on refresh)
+        err_str = str(e).lower()
+        if "not modified" in err_str or "message is not modified" in err_str:
+            return None
         if not _premium_rejected(e):
             raise
         logger.warning(f"Telegram rejected premium emoji on edit_message_text: {e}")
@@ -5169,6 +5173,11 @@ def get_admin_menu():
 
 # ---- Admin callbacks ----
 def handle_admin_callback(call, data, chat_id, msg_id):
+    # Answer the callback query immediately to dismiss Telegram's loading spinner
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
     if data == "admin_dashboard":
         stats = get_dashboard_stats()
         text = (f"{pe('stats', '📊')} <b>DASHBOARD</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
@@ -5584,6 +5593,7 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         return
 
     if data == "admin_withdrawals":
+        bot.answer_callback_query(call.id)
         pending = get_pending_withdrawals()
         text = "💳 <b>Pending Withdrawals</b>\n━━━━━━━━━━━━━━━━━━━━━\n"
         if not pending:
@@ -5630,7 +5640,7 @@ def handle_admin_callback(call, data, chat_id, msg_id):
             first_nm = user_info[2] or ""
             user_nm = user_info[1] or ""
             display_name = html_mod.escape(first_nm) if first_nm else str(uid)
-            username_str = f" (@{{html_mod.escape(user_nm)}})" if user_nm else ""
+            username_str = f" (@{html_mod.escape(user_nm)})" if user_nm else ""
         else:
             display_name = str(uid)
         acct = html_mod.escape(full_name or "")
@@ -5651,7 +5661,13 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         markup.add(ibtn("✅ Approve", callback_data=f"admin_approve_wd|{req_id}", style="success", icon="checkmark"))
         markup.add(ibtn("❌ Decline", callback_data=f"admin_reject_wd|{req_id}", style="danger", icon="cross"))
         markup.add(ibtn("Back", callback_data="admin_withdrawals", style="primary", icon="back"))
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            try:
+                bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+            except Exception:
+                pass
         return
 
     if data == "admin_approve_withdrawal":
@@ -5879,25 +5895,37 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         bot.edit_message_text(f"\u0024 <b>SET MAX WITHDRAW</b>\n\nCurrent: <code>${get_withdraw_limits()[1]:.2f}</code>\n\nSend a positive numeric value:", chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
         return
 
-    # NEW: One-click backup - dumps all tables to backup_light_premium.json
+    # One-click backup - dumps all tables to backup_light_premium.json
     if data == "admin_backup":
+        bot.answer_callback_query(call.id, "\U0001f4e6 Creating backup...", show_alert=False)
         try:
             path, counts = backup_all_tables()
             size_kb = os.path.getsize(path) / 1024
             total_rows = sum(counts.values())
-            text = (f"\u2705 <b>Backup Complete</b>\n\n"
+            # Send the backup file to admin
+            backup_text = (f"\u2705 <b>Backup Complete</b>\n\n"
                     f"\U0001f4e6 File: <code>backup_light_premium.json</code>\n"
                     f"\U0001f4be Size: <code>{size_kb:.1f} KB</code>\n"
                     f"\U0001f4ca Total rows: <code>{total_rows}</code>\n\n")
             for t, n in counts.items():
                 if n:
-                    text += f"\u2022 {t}: {n}\n"
+                    backup_text += f"\u2022 {t}: {n}\n"
             with open(path, "rb") as f:
-                bot.send_document(chat_id, f, caption=text, parse_mode="HTML")
+                bot.send_document(chat_id, f, caption=backup_text, parse_mode="HTML")
+            # Show backup summary in the admin panel instead of deleting it
+            summary = (f"\u2705 <b>Backup Complete</b>\n\n"
+                       f"\U0001f4be Saved to: <code>backup_light_premium.json</code>\n"
+                       f"\U0001f4ca Rows: <code>{total_rows}</code>\n\n"
+                       f"\U0001f4c4 File sent above \u2b06\ufe0f")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(ibtn("Back to Admin Panel", callback_data="admin_panel", style="primary", icon="back"))
             try:
-                bot.delete_message(chat_id, msg_id)
+                bot.edit_message_text(summary, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
             except Exception:
-                pass
+                try:
+                    bot.send_message(chat_id, summary, parse_mode="HTML", reply_markup=markup)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Backup failed: {e}")
             bot.answer_callback_query(call.id, f"\u274c Backup failed: {e}", show_alert=True)
