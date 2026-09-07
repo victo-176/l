@@ -715,23 +715,20 @@ def restore_from_backup():
         finally:
             conn.close()
 
+# Sentinel file on persistent disk — survives DB wipes
+_DB_INIT_SENTINEL = os.path.join(PERSISTENT_DIR, ".db_initialized")
+
 def auto_restore_if_empty():
     """On FIRST boot only: if DB is empty and a backup file exists, restore it.
-    Sets db_initialized=1 after first successful run to prevent future overwrites."""
+    Uses a sentinel FILE (not DB) to remember it already ran — survives DB wipes."""
     try:
-        # Check if we've already initialized — if so, NEVER auto-restore
+        # If the sentinel file exists, we already initialized — NEVER restore
+        if os.path.exists(_DB_INIT_SENTINEL):
+            return
+
+        # Check if DB has any data at all
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        try:
-            c.execute("SELECT value FROM bot_settings WHERE key='db_initialized'")
-            row = c.fetchone()
-            if row and row[0] == '1':
-                conn.close()
-                return  # Already initialized — do not touch the DB
-        except Exception:
-            pass  # Table might not exist yet, continue
-
-        # Check if DB has any data at all (across all critical tables)
         has_data = False
         for tbl in ['users', 'otp_logs', 'seen_otps', 'number_app_assignments']:
             try:
@@ -746,8 +743,12 @@ def auto_restore_if_empty():
 
         if has_data:
             logger.info("Backup restore skipped: DB already has data")
-            # Mark as initialized so we never try again
-            set_setting('db_initialized', '1')
+            # Mark as initialized via sentinel file
+            try:
+                with open(_DB_INIT_SENTINEL, 'w') as f:
+                    f.write(str(int(time.time())))
+            except Exception:
+                pass
             return
 
         if not os.path.exists(BACKUP_FILE):
@@ -757,8 +758,12 @@ def auto_restore_if_empty():
         ok, info = restore_from_backup()
         if ok:
             logger.info(f"Auto-restore complete: {info}")
-            # Mark as initialized so we never overwrite again on future restarts
-            set_setting('db_initialized', '1')
+            # Mark as initialized so we NEVER overwrite again
+            try:
+                with open(_DB_INIT_SENTINEL, 'w') as f:
+                    f.write(str(int(time.time())))
+            except Exception:
+                pass
             try:
                 for admin_id in ADMIN_IDS:
                     try:
@@ -769,14 +774,6 @@ def auto_restore_if_empty():
                 pass
         else:
             logger.error(f"Auto-restore FAILED: {info}")
-            try:
-                for admin_id in ADMIN_IDS:
-                    try:
-                        bot.send_message(admin_id, f"🚨 <b>Auto-Restore Failed!</b>\n\n<code>{info}</code>", parse_mode="HTML")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
     except Exception as e:
         logger.error(f"auto_restore_if_empty error: {e}")
 
@@ -5928,7 +5925,11 @@ def handle_admin_callback(call, data, chat_id, msg_id):
         try:
             path, counts = backup_all_tables()
             # Mark DB as initialized so auto-restore never overwrites it again
-            set_setting('db_initialized', '1')
+            try:
+                with open(_DB_INIT_SENTINEL, 'w') as f:
+                    f.write(str(int(time.time())))
+            except Exception:
+                pass
             size_kb = os.path.getsize(path) / 1024
             total_rows = sum(counts.values())
             # Send the backup file to admin
